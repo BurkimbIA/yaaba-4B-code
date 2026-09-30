@@ -1,8 +1,9 @@
 """Keeping evaluation data out of training.
 
-A filter that compared raw text to whitespace-collapsed text ran for weeks
-without ever matching, leaving 399 evaluation documents in the mixture.
-Removal may be exact; the *check* must be wider than the removal.
+Texts are compared on relaxed keys (case and whitespace folded). A filter that
+compared raw text with whitespace-collapsed text never matched, and 399
+evaluation documents stayed in the mixture. Removal can be exact, but the
+check has to be wider than the removal.
 """
 
 from __future__ import annotations
@@ -36,10 +37,8 @@ Leak = Literal["equal", "contained"]
 
 
 def load(path: Path | str) -> dict[str, set[str]]:
-    """Held-out texts by capability, stored as relaxed keys.
-
-    Storing keys rather than texts makes it impossible to forget to relax the
-    comparison at call time.
+    """Held-out texts by capability, stored as relaxed keys, so that a caller cannot
+    compare them unrelaxed.
     """
     by_capability: dict[str, set[str]] = {}
     with open(path, encoding="utf-8") as handle:
@@ -49,11 +48,10 @@ def load(path: Path | str) -> dict[str, set[str]]:
     return by_capability
 
 
-# A part that is not in `TARGETS` gets an empty forbidden set, so it is checked
-# against nothing and reports clean. That is right for a part with no held-out
-# counterpart, and it is also what a typo produces. Pass this instead when the
-# text belongs to no part and every capability applies -- an SFT turn, say,
-# which is assembled from all of them.
+# A part missing from `TARGETS` is checked against nothing and reports clean,
+# which is also what a typo in its name gives. Use this for text that belongs to
+# no single part and must be checked against every capability, such as an SFT
+# turn.
 EVERYTHING: Final = "*"
 
 

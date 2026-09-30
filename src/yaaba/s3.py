@@ -1,16 +1,14 @@
 """Checkpoint persistence, driven by the standard AWS environment variables.
 
-The same code runs from Colab, RunPod or a laptop with no provider glue:
+The same code runs on Colab, RunPod or a laptop:
 
     AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_ENDPOINT_URL_S3
     S3_CHECKPOINT_URI   where checkpoints go; unset means every call is a no-op
     REQUIRE_S3_SYNC     "true" turns an upload failure into an error
 
-Two rules learned the hard way. Uploads are best-effort by default, because a
-network hiccup must not end a twelve-hour run. And a checkpoint is uploaded
-*whole*: resuming needs the optimizer state, so uploading the adapter alone
-makes `--resume` work only when the local disk survived, which is the one case
-where it is not needed.
+Uploads are best effort by default, so a network error does not end a long
+run. A checkpoint is uploaded whole, optimizer state included, because resuming
+needs it and the local disk is usually gone by then.
 """
 
 from __future__ import annotations
@@ -21,13 +19,13 @@ import sys
 from pathlib import Path
 from typing import Final
 
-# Large, and only ever needed from the most recent checkpoint, so it is pruned
-# from older ones.
+# Large, and only needed on the most recent checkpoint, so it is pruned from
+# older ones.
 RESUME_STATE: Final = ("optimizer.pt", "scheduler.pt", "rng_state.pth", "scaler.pt")
 
-# Without this the Trainer raises FileNotFoundError before the first step. It is
-# tiny, so it is never pruned, and a checkpoint lacking it cannot be resumed at
-# all: the run must start fresh rather than crash after allocating the card.
+# The Trainer cannot resume without this file. It is small and never pruned; a
+# checkpoint without it starts a fresh run instead of crashing after the GPU is
+# allocated.
 REQUIRED_TO_RESUME: Final = "trainer_state.json"
 
 DEFAULT_ENDPOINT: Final = "https://t3.storage.dev"
@@ -57,13 +55,12 @@ def _fail(message: str, error: Exception) -> None:
 
 
 def writable(uri: str) -> str | None:
-    """None if `uri` accepts a write, else why it does not.
+    """None if `uri` accepts a write, else the reason it does not.
 
-    A round trip of a few bytes, called once before a run starts. Uploads
-    themselves only warn when they fail (see `_fail`), which is right for a
-    transient blip mid-run and wrong for credentials that never worked: a run
-    then trains for hours and leaves nothing behind. Two seconds here buys
-    that.
+    A round trip of a few bytes, called once before a run starts. Uploads only
+    warn on failure (see `_fail`), which suits a short network error but not
+    credentials that never worked: the run would train for hours and save
+    nothing.
     """
     if not uri:
         return None
@@ -76,8 +73,8 @@ def writable(uri: str) -> str | None:
         client.delete_object(Bucket=bucket, Key=key)
         return None
     except Exception as error:  # noqa: BLE001
-        # The message can carry the endpoint but never a credential: boto3 puts
-        # the key id in some errors, so only the class and its text are kept.
+        # boto3 puts the key id in some errors, so only the error class and a
+        # truncated message are returned.
         return f"{type(error).__name__}: {error}"[:300]
 
 
@@ -116,8 +113,9 @@ def upload_dir(directory: Path, uri: str, quiet: bool = False) -> int:
 
 
 def download_file(uri: str, path: Path) -> bool:
-    """Download one object. `download_dir` lists a prefix and finds nothing for
-    a single key, which silently yields an empty directory."""
+    """Download one object. `download_dir` lists a prefix, which finds nothing for a
+    single key and yields an empty directory.
+    """
     if not uri:
         return False
     bucket, key = _split(uri)
@@ -131,7 +129,7 @@ def download_file(uri: str, path: Path) -> bool:
 
 
 def download_dir(uri: str, directory: Path) -> int:
-    """Download a prefix into `directory`. The half that makes resuming work."""
+    """Download a prefix into `directory`. Used to resume a run."""
     if not uri:
         return 0
     bucket, prefix = _split(uri)
@@ -217,10 +215,10 @@ def read_bytes(uri: str) -> bytes | None:
 
 
 def _digest(stream) -> str:
-    """sha256 of a stream, a megabyte at a time.
+    """sha256 of a stream, one megabyte at a time.
 
-    Never `read()` the whole object: a 53 MB parquet plus its local twin is
-    106 MB per comparison, and nothing bounds what a caller points this at.
+    Objects are never read whole: a 53 MB parquet and its local copy would take
+    106 MB per comparison.
     """
     running = hashlib.sha256()
     for block in iter(lambda: stream.read(1 << 20), b""):
@@ -236,14 +234,12 @@ def digest(path: Path) -> str:
 def matches(uri: str, path: Path) -> bool | None:
     """`True` identical, `False` different, `None` when S3 has nothing there.
 
-    Absent and different call for opposite actions: one means the deposit never
-    happened, the other that it happened wrong. Collapsing them into `False`
-    made `verify_deposit` print DIFFERENT for a key that was simply missing.
+    Absent and different call for different actions (upload again, or find
+    what went wrong), so they are kept apart.
 
-    A deposit that announces itself is not a deposit that happened:
-    Tigris serves a per-region cache, so a key written and re-read from the
-    writing machine can still reach a reader elsewhere as the old object. Only
-    reading the object back and hashing it answers the question.
+    The object is read back and hashed because Tigris serves a per-region
+    cache: a key rewritten from one machine can still reach a reader elsewhere
+    as the old object.
     """
     if not uri or not path.is_file():
         return None
@@ -257,11 +253,7 @@ def matches(uri: str, path: Path) -> bool | None:
 
 
 def run_names(uri: str) -> list[str]:
-    """The run directories directly under `uri`, alphabetically.
-
-    Callers used to reach for `_split` and `_client` to do this by hand, which
-    is the one thing a module boundary exists to prevent.
-    """
+    """The run directories directly under `uri`, alphabetically."""
     if not uri:
         return []
     bucket, prefix = _split(uri)
@@ -278,9 +270,8 @@ def run_names(uri: str) -> list[str]:
 def checkpoint_names(uri: str) -> list[tuple[str, int]]:
     """Every `checkpoint-N` under `uri`, in training order.
 
-    Sorted numerically, never lexicographically: that order puts
-    `checkpoint-542` after `checkpoint-2168`, which would resume from the wrong
-    epoch and plot the measurement curve backwards.
+    Sorted by number: in string order `checkpoint-542` comes after
+    `checkpoint-2168`, which would resume from the wrong epoch.
     """
     if not uri:
         return []
@@ -307,10 +298,10 @@ def latest_checkpoint(uri: str) -> tuple[str, int] | None:
 
 
 def list_runs(uri: str, prefix: str) -> list[str]:
-    """Run directories under `uri` starting with `prefix`, chronologically.
+    """Run directories under `uri` starting with `prefix`, oldest first.
 
-    Run names are timestamped, so lexicographic order is chronological here.
-    Unlike checkpoint names, which are not.
+    Run names are timestamped, so string order is chronological for them. It is
+    not for checkpoint names (see `checkpoint_names`).
     """
     if not uri:
         return []

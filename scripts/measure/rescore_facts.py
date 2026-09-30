@@ -1,21 +1,18 @@
 """Re-score the stored factual answers, without a GPU.
 
-A verdict in `evaluation/points/*.json` is a function of three things: the
-answer, the expected list, and the scorer. Only the answer costs GPU time. When
-the other two are wrong -- and both were -- re-running the models would be
-paying for a measurement that is already on disk.
+A verdict in `evaluation/points/*.json` depends on the answer, the expected
+list and the scorer. Only the answer needs the GPU, so after a fix to the
+expected lists or to the scorer, the stored answers are scored again here.
 
-Three defects were repaired at once, all found by reading the stored answers:
+Fixes made this way, all found by reading stored answers:
 
-    `bf04`  expected `non|no|enclav|landlocked` and missed the most natural
-            phrasing of the right answer, `n'a pas d'acces a la mer`.
-    `no`    matched inside `nord` and `notamment`, scoring two checkpoints RIGHT
-            on answers that never addressed the question.
-    `af02`  trapped on `senegal` but not `Senegal` with its accent, so three
-            points that had learned the wrong river were filed as ignorant.
+- an expected list that missed a common phrasing of the right answer;
+- `no` matching inside `nord` and `notamment`, which scored two checkpoints
+  right on answers that never addressed the question;
+- a trap written without its accent, which filed three answers giving the
+  trap as not known.
 
-What this script cannot repair is the fourth defect, truncation: an answer cut
-at the token budget stays cut. That one needs the GPU again.
+An answer cut at the token budget stays cut; that needs a new generation.
 """
 
 from __future__ import annotations

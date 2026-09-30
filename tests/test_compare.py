@@ -1,8 +1,8 @@
-"""`--compare` and `--arms` must apply the same stop rule.
+"""`--compare` and `--arms` apply the same stop rule.
 
-`compare` once carried its own copy of the rule. The copy cut the curve at a
-point whose facts were merely not comparable, and cut every arm at the first
-signal of any arm, so it kept nothing where `--arms` kept one point per arm.
+`compare` used to carry its own copy of the rule. It cut a curve at a point
+whose facts were only not comparable, and cut every arm at the first signal of
+any arm, so it kept nothing where `--arms` kept one point per arm.
 """
 
 from __future__ import annotations
@@ -39,7 +39,7 @@ def write(folder: Path, points: list[tuple[str, dict]]) -> str:
 def test_facts_not_comparable_do_not_cut_the_curve(tmp_path, capsys):
     pattern = write(tmp_path, [
         ("base", point("base", None, 2.0, ["f1", "f2"])),
-        # measured on another item set: a note, not a stop signal
+        # measured on another item set: reported, but no stop signal
         ("A-checkpoint-100", point("checkpoint-100", "A", 1.8, ["f1"])),
         ("A-checkpoint-200", point("checkpoint-200", "A", 1.5, ["f1", "f2"])),
         ("A-checkpoint-300", point("checkpoint-300", "A", 1.6, ["f1", "f2"])),

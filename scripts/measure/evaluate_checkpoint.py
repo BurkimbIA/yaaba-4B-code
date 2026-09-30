@@ -1,17 +1,19 @@
-"""Measure one checkpoint, and decide which of the five to keep.
+"""Measure one checkpoint, and pick the checkpoint to keep on each arm's curve.
 
     python scripts/measure/evaluate_checkpoint.py --checkpoint base      # on GPU
     python scripts/measure/evaluate_checkpoint.py --checkpoint /path/checkpoint-1094
-    python scripts/measure/evaluate_checkpoint.py --compare              # here
+    python scripts/measure/evaluate_checkpoint.py --compare              # no GPU
+    python scripts/measure/evaluate_checkpoint.py --arms                 # no GPU
 
-Three metric families, because one does not suffice: a perplexity once dropped
-70 % while the country's capital moved from Ouagadougou to Bobo-Dioulasso.
-Bits per character on seven held-out capabilities, twenty
-automatically scored facts, twenty-six generative probes.
+A checkpoint is measured three ways: bits per character on seven held-out
+capabilities, 52 automatically scored facts, and 26 generative probes. Perplexity
+alone missed a checkpoint that moved the capital of Burkina Faso from Ouagadougou
+to Bobo-Dioulasso.
 
-Two stop signals: Moore stops improving, or a fact the base model knew
-is lost. The best checkpoint minimises Moore without crossing either, and past
-the first signal a better number no longer measures the same thing.
+Three signals stop a curve: Moore bits per character rise, a fact the base knew is
+answered with its known wrong answer, or English, French, code or maths lose more
+than 3 %. The kept checkpoint has the lowest Moore bits per character before the
+first signal.
 """
 
 from __future__ import annotations
@@ -35,49 +37,43 @@ POINTS = EVAL / "points"
 CONFIG = json.loads((ROOT / "configs" / "cpt.json").read_text(encoding="utf-8"))
 BASE, WINDOW = CONFIG["base"], CONFIG["fenetre"]
 POINTS_URI = "s3://burkimbia-store/text/moore-assistant/cpt/points"
-# The destination is a PARAMETER of `measure`, not only this constant: a second
-# stage writing here would pollute the CPT curve.
+# `measure` also takes the destination as a parameter, so a second stage can
+# write elsewhere and leave the CPT curve alone.
 
 SHOULD_DROP = ("moore_humain", "francais_parallele")
 SHOULD_HOLD = ("anglais", "francais", "code", "maths")
-# The CPT exit criterion: these four may lose at most this much against the
-# base point. It was printed as a table and left to the eye; a criterion the
-# code does not compute is not a criterion.
+# CPT exit criterion: each of these four may lose at most this fraction of its
+# base bits per character.
 HOLD_TOLERANCE = 0.03
 WATCH_APART = ("moore_whisper",)
 
-# A note, not a stop signal. `keepable` cuts an arm's curve at the first
-# mark, so leaving this one in the same list made "we refuse to compare"
-# read as "the model regressed", and every arm came back with nothing
-# keepable the day six points moved to another budget.
+# Printed next to a point but never a stop signal: it only says that the facts
+# were scored at another budget or on other items.
 NOT_COMPARABLE = ("facts not comparable: another budget, "
                   "or another set of items")
 
 
 def overlap(a: str, b: str) -> float:
-    """Word overlap, to turn the model echoing the question into a number."""
+    """Word overlap between a question and its answer, to measure echo."""
     first, second = set(a.casefold().split()), set(b.casefold().split())
     return len(first & second) / max(len(first), 1)
 
 
-# An SFT point trained on a CPT arm, by the name the notebook gives it:
-# `C-4820-checkpoint-1191`. What makes it recognisable is the arm and its CPT
-# step before `checkpoint-`, which a CPT point (`checkpoint-6005`) never has.
+# An SFT point trained on a CPT arm, as the notebook names it:
+# `C-4820-checkpoint-1191`. CPT points (`checkpoint-6005`) have no arm and step
+# prefix.
 POINT_DE_BRAS = re.compile(r"^(?:A|B|C|P|P2)-\d+-checkpoint-\d+$")
 
 
 def load(checkpoint: str, socle: str | None = None):
-    """The base, then `socle`, then `checkpoint` merged in, and the name.
+    """The base with `socle` and then `checkpoint` merged in, and the point's name.
 
-    Merging rather than keeping the adapter attached makes generation as fast as
-    the base and is what every measurement here does.
+    Adapters are merged so that generation runs at the speed of the base.
 
-    **`socle` is not optional for an SFT point trained on an arm.** The SFT
-    stage merges the arm's CPT adapter into the base and trains a fresh adapter
-    **on top of that**, so its weights are relative to `base + CPT`. Loading it
-    onto the bare base applies an adapter to a model it was never trained
-    against: that once gave `A + SFT` 4.7883 bits per character of Moore, worse than the base itself and four times the 1.2759 of `A` alone.
-    It produced numbers, not an error, which is why the guard below exists.
+    An SFT point trained on an arm needs `socle`, the arm's CPT adapter, because
+    its SFT adapter was trained on top of base + CPT. Loaded on the bare base it
+    still returns numbers (once 4.79 Moore bits per character, against 1.28 for
+    the arm alone), so the guard below raises instead.
     """
     if socle is None and POINT_DE_BRAS.match(Path(checkpoint).name):
         raise SystemExit(
@@ -107,34 +103,23 @@ def load(checkpoint: str, socle: str | None = None):
 
 def generate(model, tokenizer, prompt: str, budget: int,
              heat: float = 0.0, seed: int | None = None) -> tuple[str, bool]:
-    """The reply, and whether it finished on its own rather than being cut.
+    """The reply, and whether it ended before the token budget.
 
-    Module level, not a closure inside `measure`: the SFT stage asks a model the
-    same kind of question outside a measurement, and a second copy of this would
-    drift from the first exactly where it matters, on `enable_thinking`.
+    Kept at module level so every caller uses the same chat template, with
+    `enable_thinking=False`.
 
-    `heat` is the one decoding knob, and it exists for one question. The
-    opening check (`moore.speaks_to_each`) rejects a point whose answers all open the same way, measured greedily, and
-    greedy takes the argmax at every step: two questions sharing the start of
-    their distribution share their opening BY CONSTRUCTION. Re-asking the same
-    twelve questions at the same point with sampling on tells which it is. If
-    variety comes back, the check measures the decoder; if it stays at one
-    opening out of twelve, it is in the weights.
+    `heat` above 0 turns sampling on. It tells whether a collapse seen at greedy
+    decoding comes from the decoder or from the weights: greedy takes the argmax
+    at every step, so questions whose distributions start alike get the same
+    opening. If sampling brings variety back, the collapse was in the decoder.
 
-    Bits per character are blind to generation because they are teacher-forced,
-    and the opening check has the opposite blind spot.
+    0.0 keeps greedy decoding, as in every stored measurement. Sampling requires
+    `seed`, so that a draw can be replayed.
 
-    0.0 is neutral and keeps greedy, so no stored measurement moves. Above it,
-    `seed` is required: a draw that cannot be replayed is not a measurement.
-
-    **`seed` must differ from one question to the next**, and the caller owns
-    that. This function seeds the global generator on every call, so passing the
-    same seed to twelve questions makes them consume the same random stream:
-    wherever their distributions are close, the same draw picks the same token,
-    and the twelve answers open alike **because they were seeded alike**. That is
-    a property of the seeding, not of the model, and it once produced a full
-    collapse (`Yaa tɩ` twelve times at `T=0.7`) that had nothing to do with the
-    model. Derive a per-question seed, `seed + index`.
+    Give each question its own seed (`seed + index`). This function reseeds the
+    global generator on every call, so one seed for all questions makes them
+    draw the same random stream, and their answers then open alike for that
+    reason alone (once `Yaa tɩ` twelve times at T=0.7).
     """
     import torch
 
@@ -145,8 +130,8 @@ def generate(model, tokenizer, prompt: str, budget: int,
 
     message = [{"role": "user", "content": prompt}]
     try:
-        # Qwen3's thinking mode is on by default and hurts: it reasons in
-        # Chinese and spends the whole token budget.
+        # Qwen3's thinking mode is on by default; it reasons in Chinese and uses up
+        # the token budget.
         text = tokenizer.apply_chat_template(message, tokenize=False,
                                              add_generation_prompt=True,
                                              enable_thinking=False)
@@ -157,9 +142,9 @@ def generate(model, tokenizer, prompt: str, budget: int,
     with torch.no_grad():
         output = model.generate(**encoded, max_new_tokens=budget,
                                 do_sample=bool(heat),
-                                # transformers ignores `temperature` when
-                                # `do_sample` is false, silently. Passing None
-                                # keeps it from looking like it applies.
+                                # transformers silently ignores `temperature`
+                                # when `do_sample` is false; None makes that
+                                # visible.
                                 temperature=heat or None,
                                 top_p=0.95 if heat else None,
                                 pad_token_id=tokenizer.eos_token_id)
@@ -184,10 +169,8 @@ def measure(checkpoint: str, out: Path, upload: bool,
 
     metrics = {}
     for capability, texts in by_capability.items():
-        # Kept per text, and not only summed: an interval needs the sample, and
-        # re-running the GPU to get one would cost more than storing 200 pairs.
-        # The order is the order of the held-out file, which is what makes a
-        # later comparison paired.
+        # Stored per text so that intervals need no GPU later. The texts keep the
+        # order of the held-out file, which pairs the comparisons between points.
         per_text: list[tuple[float, int]] = []
         nll, n_tokens, n_chars = 0.0, 0, 0
         for text in texts:
@@ -248,8 +231,7 @@ def measure(checkpoint: str, out: Path, upload: bool,
 
 
 def ask_facts(model, tokenizer) -> tuple[list[dict], dict]:
-    """Every item of the probe, answered and scored. Shared by `measure` and
-    `refacts`."""
+    """Answer and score every fact item. Shared by `measure` and `refacts`."""
     facts = []
     for line in (EVAL / "faits.jsonl").open(encoding="utf-8"):
         fact = json.loads(line)
@@ -267,28 +249,18 @@ def ask_facts(model, tokenizer) -> tuple[list[dict], dict]:
 
 def refacts(checkpoint: str, out: Path, upload: bool,
             socle: str | None = None, point_name: str | None = None) -> int:
-    """Re-answer the probe into an existing point, leaving the rest alone.
+    """Re-answer the fact items of an existing point and leave its other measures.
 
-    The bits per character of a point cost minutes and do not depend on the
-    generation budget; the answers cost seconds and do. Raising `BUDGET` from
-    128 to 320 therefore does not justify re-running `measure`, which would
-    recompute 200 held-out texts in order to change twenty strings.
+    Bits per character do not depend on the generation budget and take minutes;
+    the fact answers depend on it and take seconds. A change of `BUDGET` only
+    needs this. `budget_faits` is stored next to the answers, since two tallies
+    compare only at the same budget.
 
-    The point must already exist: this repairs a measurement, it does not make
-    one. `budget_faits` is written next to the answers, because a tally is only
-    comparable to another tally taken at the same budget.
+    `point_name` names the point file when it differs from the adapter folder:
+    the folder `checkpoint-218` holds the adapter of `P2-6120-checkpoint-218`.
 
-    **`point_name` exists because the checkpoint directory is not the point.**
-    The adapter downloaded from S3 sits in a folder called `checkpoint-218`,
-    while the point that describes it is `P2-6120-checkpoint-218.json`. Deriving
-    the file name from the folder made this look for a point that does not
-    exist.
-
-    **And `socle` is not optional for an SFT point trained on an arm**, for the
-    same reason as in `measure`: without it the adapter is applied to a model it
-    was never trained against and the run returns numbers instead of an error.
-    The guard in `load` does not catch it here, because the name it
-    recognises is the point's, not the folder's.
+    Pass `socle` for an SFT point trained on an arm, as for `load`. The guard in
+    `load` cannot catch it here, because it only sees the folder name.
     """
     name = "base" if checkpoint == "base" else (point_name or Path(checkpoint).name)
     path = out / f"{name}.json"
@@ -304,8 +276,7 @@ def refacts(checkpoint: str, out: Path, upload: bool,
     point["faits"], point["faits_compte"] = ask_facts(model, tokenizer)
     point["budget_faits"] = BUDGET
     path.write_text(json.dumps(point, ensure_ascii=False, indent=1), encoding="utf-8")
-    # Two denominators on purpose: the probe grew from 20 items to 52, and
-    # printing one of them would hide that the item set changed.
+    # Both denominators, because the probe grew from 20 items to 52.
     print(f"\n  {was}/{over} -> "
           f"{point['faits_compte']['juste']}/{len(point['faits'])}")
     print(f"-> {path}")
@@ -317,12 +288,10 @@ def refacts(checkpoint: str, out: Path, upload: bool,
 
 
 def order(name: str) -> tuple[int, int]:
-    """Base first, then checkpoints by step. Numerically, never lexicographically.
+    """Sort key: base first, then checkpoints by step, compared as numbers.
 
-    The step is what follows `checkpoint-`, not every digit in the name. A point
-    measured from a directory carrying its run, `A-20260831-1024-checkpoint-219`,
-    used to key on 202608311024219: the ordering became run timestamp first and
-    step second, by accident of how many digits each step happened to have.
+    The step is the number after `checkpoint-`. Reading every digit in the name
+    once sorted `A-20260831-1024-checkpoint-219` by its run timestamp.
     """
     if name == "base":
         return (0, 0)
@@ -332,11 +301,10 @@ def order(name: str) -> tuple[int, int]:
 
 
 def arm_of(point: dict) -> str:
-    """Which arm produced this point, read from the run directory in its path.
+    """The arm that produced a point, read from the run directory in its path.
 
-    `/content/cpt/A-20260831-1024/checkpoint-6005` -> `A`. Points from every arm
-    land in one directory, so without this the curve of one arm and the curve of
-    another get spliced into a single sequence.
+    `/content/cpt/A-20260831-1024/checkpoint-6005` gives `A`. All arms write
+    their points to one directory, and this is what separates their curves.
     """
     if point.get("point") == "base":
         return "base"
@@ -348,54 +316,43 @@ def arm_of(point: dict) -> str:
 
 
 def asked_the_same(point: dict) -> tuple[int, frozenset[str]]:
-    """What a fact tally has to share with another one to be its comparable."""
+    """What two fact tallies must share to be compared: budget and item set."""
     return budget_of(point), frozenset(f["id"] for f in point["faits"])
 
 
 def same_fact_budget(first: dict, second: dict) -> bool:
-    """Whether two points scored their facts the same way.
+    """Whether two points scored their facts at the same budget and on the same items.
 
-    The test is agreement, not recency: two points both scored at 48 compare to
-    each other perfectly well. Only a mixed pair measures the budget instead of
-    the models.
-
-    It used to test whether `complet` was *present*, which separates 48 from
-    128 and **not 128 from 320** -- both carry the field. Once six points were
-    re-answered at 320 against twenty-five still at 128, the guard passed them
-    all and the arm ranking moved a whole arm's kept point by three epochs.
-
-    **The item set is the second half of the same question**, and it was
-    missing until the probe was widened from 20 items to 52. A point that answered 20 and a point that answered 52 put 13 and 38
-    in the same column of the same table, and the second number looks like a
-    gain. `lost` never had the defect, because it is keyed by item id; the
-    tally did.
+    Two points scored at 48 tokens compare fine. A point at 128 and one at 320
+    do not, because a longer budget lets more answers finish. The item set
+    matters in the same way: 13 of 20 and 38 of 52 would otherwise share a
+    column. `lost` is keyed by item id and does not depend on this.
     """
     return asked_the_same(first) == asked_the_same(second)
 
 
 def forgotten(known: set[str], verdicts: dict[str, str]) -> list[str]:
-    """Items the start answered and this point no longer answers at all.
+    """Known facts that this point no longer answers at all.
 
-    Reported, never a rejection. It is the count that carries the
-    conclusion, with the interval the 52-item probe makes readable;
-    a per-item veto rejected every checkpoint on items that come back later in
-    the same run.
+    Printed next to the verdict and never used to reject a point: at greedy
+    decoding single items flip back and forth within a run, and a per-item veto
+    rejected every checkpoint.
     """
     return sorted(i for i in known if verdicts.get(i) == "faux")
 
 
 def marks_for(base: dict, earlier: dict, point: dict, known: set[str]) -> list[str]:
-    """Every stop signal `point` crosses, against its own predecessor and base.
+    """Every stop signal `point` crosses, judged against the base and `earlier`.
 
-    `earlier` is the previous point OF THE SAME ARM, never of the sorted list.
-    Shared by the curve and the arm ranking so the two cannot drift.
+    `earlier` is the previous point of the same arm. `keepable` and `compare`
+    both call this, so they apply one rule.
     """
     marks = []
     current = point["mesures"]["moore_humain"]["bits_par_caractere"]
     previous = earlier["mesures"]["moore_humain"]["bits_par_caractere"]
 
-    # A rise the sample supports, not any rise: comparing point estimates
-    # makes the noise floor the stop criterion.
+    # Only a rise whose interval excludes zero counts; comparing point estimates
+    # would stop on noise.
     rise = gap(earlier, point, "moore_humain")
     if rise is None:
         if current >= previous:
@@ -405,13 +362,9 @@ def marks_for(base: dict, earlier: dict, point: dict, known: set[str]) -> list[s
         marks.append(f"overfitting (bpc {rise.value:+.4f} "
                      f"[{rise.low:+.4f}, {rise.high:+.4f}])")
 
-    # An item the base got right and this point answers DIFFERENTLY: it learned
-    # something else, which is the regression. `faux`, it no longer
-    # answers, is counted by `forgotten` and reported beside the verdict, not
-    # here: measured on five points it flips back and forth inside one run, so
-    # as a per-item veto it rejected every checkpoint on the stability of a
-    # binary item at greedy decoding. `ambigu` is kept apart too: a
-    # substring matcher could not tell, so it is a question for a human.
+    # A known fact now answered with its trap is a regression. `faux` (no answer)
+    # is only reported, by `forgotten`, because single items flip within a run at
+    # greedy decoding. `ambigu` goes to a human reader.
     verdicts = {f["id"]: f["note"] for f in point["faits"]}
     if not same_fact_budget(base, point):
         marks.append(NOT_COMPARABLE)
@@ -420,8 +373,7 @@ def marks_for(base: dict, earlier: dict, point: dict, known: set[str]) -> list[s
     if lost:
         marks.append(f"facts learned otherwise: {', '.join(lost)}")
 
-    # bpc measures cost: it going UP is the loss. Comparing the wrong way round
-    # would silently pass every degraded checkpoint.
+    # Bits per character are a cost, so a rise is a loss.
     for capability in SHOULD_HOLD:
         was = base["mesures"][capability]["bits_par_caractere"]
         now = point["mesures"][capability]["bits_par_caractere"]
@@ -432,31 +384,25 @@ def marks_for(base: dict, earlier: dict, point: dict, known: set[str]) -> list[s
 
 
 def answer_key(arm: str, point_name: str) -> tuple[str, str]:
-    """(arm, training step): what identifies a point across two file families.
+    """(arm, training step), the key that matches answer files to point files.
 
-    The name alone does NOT: the same checkpoint is on disk as
-    `218-checkpoint-218` in the answers and `P2-6120-checkpoint-218` in the
-    points, and matching on the name silently found no answer for exactly the
-    points the gate is about. Both families record the arm (`depart` there,
-    the run directory here) and the step, so the key is derived, not guessed.
+    Their names differ (`218-checkpoint-218` for the answers,
+    `P2-6120-checkpoint-218` for the point), so matching on names found no
+    answers. Both record the arm and the step.
     """
     return arm, point_name.rpartition("checkpoint-")[2] or point_name
 
 
 def criterion_answers(directory: Path = EVAL) -> dict[tuple[str, str], list[str]]:
-    """The twelve criterion answers of each point, by (arm, step).
+    """The answers to the twelve held-out questions, by (arm, step).
 
-    They are not in the point files: `measure` stores three conversation probes,
-    the twelve held turns are generated by the SFT notebook and land in
-    `evaluation/reponses-*.jsonl`. Reading them here is what lets the
-    point SELECTION apply the collapse checks, and not only the notebook that
-    prints them.
+    `measure` does not generate them: the SFT notebook writes them to
+    `evaluation/reponses-*.jsonl`. Reading them here lets point selection apply
+    the collapse checks.
 
-    **Only answers to the CURRENT twelve questions count.** Eight of the twelve
-    files on disk answer earlier question sets, and taking them at the glob
-    makes the gate read a point's old answers and clear it. The test
-    is the question itself, not the file's date or name. The twelve come from
-    `questions_tenues.jsonl` in the gated evaluation set.
+    Only answers to the current twelve questions count, matched on the question
+    text, because older answer files hold earlier question sets. The questions
+    come from `questions_tenues.jsonl` in the gated evaluation set.
     """
     held = {" ".join(sorted(moore._WORD.findall(q["question"].casefold())))
             for q in (json.loads(line) for line in
@@ -475,29 +421,23 @@ def criterion_answers(directory: Path = EVAL) -> dict[tuple[str, str], list[str]
 
 
 def collapsed(point: dict, answers: dict[tuple[str, str], list[str]]) -> str | None:
-    """Why this point is not keepable for want of variety, or None.
+    """Why this point collapsed, or None.
 
-    Two rules, because one opening count sees only the first two words:
+    Two checks, because the opening count sees only the first two words:
 
-    - `moore.speaks_to_each`: no single opening may answer a majority of the
+    - `moore.speaks_to_each`: no single opening answers a majority of the
       questions;
-    - `moore.answers_each`: no complete answer may be given to two questions.
+    - `moore.answers_each`: no complete answer is given to two questions.
 
-    Neither replaces the other. On two decoding passes of one checkpoint they
-    disagreed on both: greedy gives twelve distinct sentences under one opening
-    (the first rejects, the second clears), and `T=1.0` answers four different
-    questions with the same sentence (the first clears, the second rejects). A gate that
-    passes a model repeating one sentence four times out of twelve does not
-    measure what it claims.
+    On one checkpoint, greedy decoding gave twelve distinct sentences under one
+    opening (the first check fails, the second passes), and sampling at T=1.0
+    gave one sentence to four questions (the first passes, the second fails).
 
-    Separate from `marks_for` on purpose, because this does NOT cut the curve:
-    collapse loosens as training goes on, the opposite of overfitting, so
-    cutting here would throw away the better points that follow.
+    Unlike `marks_for`, this does not cut the curve: collapse fades as training
+    goes on, so later points can still be kept.
 
-    A point with no answers to the current questions is **kept and flagged**,
-    not rejected: a missing measurement is not evidence of collapse. It is the
-    same treatment as `NOT_COMPARABLE`, and it is the weak spot of this gate,
-    so the caller prints the flag next to the point it chose.
+    A point with no answers to the current questions gets None here, and the
+    caller flags it (see `unchecked`).
     """
     said = answers.get(answer_key(arm_of(point), point["point"]))
     if not said:
@@ -514,24 +454,19 @@ def collapsed(point: dict, answers: dict[tuple[str, str], list[str]]) -> str | N
 
 
 def unchecked(point: dict, answers: dict[tuple[str, str], list[str]]) -> bool:
-    """Whether the collapse checks could not run on this point for want of
-    answers."""
+    """Whether the point has no answers, so the collapse checks could not run."""
     return not answers.get(answer_key(arm_of(point), point["point"]))
 
 
 def keepable(base: dict, curve: list[dict],
              answers: dict[str, list[str]] | None = None
              ) -> tuple[dict | None, str | None, list[tuple[str, str]]]:
-    """The point to keep from one arm's curve, where it was cut, what it skipped.
+    """The point to keep on one arm's curve, where the curve was cut, and the
+    collapsed points skipped.
 
-    Past the first stop signal a better number no longer measures the same
-    thing, so the best point is the lowest Moore bpc *before* it, not
-    the lowest overall and not the last one measured.
-
-    The collapse checks are applied apart: a collapsed point is dropped from the eligible ones
-    and the curve CONTINUES past it. Passing no `answers` skips the rule rather
-    than inventing a verdict, and every skip is returned so the caller prints
-    it.
+    The kept point has the lowest Moore bits per character before the first stop
+    signal. Collapsed points are skipped and the curve goes on past them. With
+    `answers=None` the collapse checks do not run.
     """
     known = {f["id"] for f in base["faits"] if f["note"] == "juste"}
     eligible: list[dict] = []
@@ -556,7 +491,9 @@ def keepable(base: dict, curve: list[dict],
 
 
 def gap(before: dict, after: dict, capability: str) -> uncertainty.Interval | None:
-    """Paired difference between two points, or None if either predates `par_texte`."""
+    """Paired difference between two points on one capability, or None when either
+    point has no per-text values.
+    """
     pairs = []
     for point in (before, after):
         measured = point["mesures"].get(capability, {})
@@ -570,10 +507,9 @@ def gap(before: dict, after: dict, capability: str) -> uncertainty.Interval | No
 
 
 def compare(pattern: str, answers: dict[tuple[str, str], list[str]] | None = None) -> int:
-    """The curve of each arm, and where it should stop. Non-zero if an arm keeps
-    nothing.
+    """The curve of each arm and where it stops. Returns 1 if an arm keeps nothing.
 
-    `answers` defaults to `criterion_answers()`, which needs the gated set.
+    `answers` defaults to `criterion_answers()`, which reads the gated set.
     """
     files = sorted(glob.glob(pattern), key=lambda f: order(Path(f).stem))
     if not files:
@@ -602,9 +538,8 @@ def compare(pattern: str, answers: dict[tuple[str, str], list[str]] | None = Non
     print(f"{'of which trapped':22s}"
           + "".join(f"{p['faits_compte']['piege']:>{width}d}" for p in points))
 
-    # Each point against the base, on the SAME held-out texts. Two independent
-    # intervals routinely overlap while the paired difference is nowhere near
-    # zero, so the table above cannot answer "is this gap real" and this can.
+    # Each point against the base, paired over the same held-out texts. Two
+    # separate intervals can overlap while the paired difference excludes zero.
     reference = points[0]
     paired = [p for p in points[1:]
               if all("par_texte" in p["mesures"].get(c, {})
@@ -632,9 +567,8 @@ def compare(pattern: str, answers: dict[tuple[str, str], list[str]] | None = Non
     known = {f["id"] for f in base["faits"] if f["note"] == "juste"}
     print(f"\nSIGNALS  (reference {base['point']}, {len(known)} facts right)")
 
-    # A curve belongs to one arm. All arms write their points into the same
-    # directory, so the predecessor of a point is the previous point OF ITS OWN
-    # ARM, never the previous one in the sorted list.
+    # A curve belongs to one arm and all arms share a directory, so a point's
+    # predecessor is the previous point of its own arm.
     curves: dict[str, list[dict]] = {}
     for point in points[1:]:
         curve = curves.setdefault(arm_of(point), [])
@@ -652,10 +586,8 @@ def compare(pattern: str, answers: dict[tuple[str, str], list[str]] | None = Non
         marks = marks_for(base, earlier, point, known)
         print(f"  {point['point']:22s} {'; '.join(marks) if marks else 'none'}")
 
-    # Where each curve stops is `keepable`'s answer, the one `--arms` uses. This
-    # function once carried its own copy of the rule, and the copy drifted: it
-    # stopped on facts that were only not comparable, and cut every arm at the
-    # first signal of any arm.
+    # `keepable` decides where each curve stops, as for `--arms`, so both commands
+    # keep the same points.
     said = criterion_answers() if answers is None else answers
     start = base["mesures"]["moore_humain"]["bits_par_caractere"]
     failed = False
@@ -664,9 +596,8 @@ def compare(pattern: str, answers: dict[tuple[str, str], list[str]] | None = Non
         for name, why in skipped:
             print(f"  {arm}/{name.removeprefix('checkpoint-')}: {why}, not keepable")
         if best is None:
-            # On stderr, because it is the REASON for the non-zero exit. Printed
-            # on stdout it left a caller that checks the return code with a
-            # traceback about the launcher and an empty stderr.
+            # The reason for the non-zero exit goes to stderr, where a caller
+            # checking the return code looks for it.
             why = (f"{crossed} already crosses a signal" if crossed
                    else "every point collapsed")
             print(f"\n{arm}: NO eligible checkpoint, {why}.", file=sys.stderr)
@@ -684,15 +615,11 @@ def compare(pattern: str, answers: dict[tuple[str, str], list[str]] | None = Non
 
 
 def arms(pattern: str, against: str = "A") -> int:
-    """Rank the arms against each other, on their last measured point.
+    """Rank the arms on their kept points, against the arm `against`.
 
-    `compare` reads a *curve*: how one arm evolves, and where it should stop.
-    This reads a *choice*: which arm to keep. They need different pairings, and
-    conflating them is what made one run's table splice another run's points
-    into its own curve.
-
-    Every gap is paired on the same held-out texts, because two independent
-    intervals routinely overlap while the paired difference is nowhere near zero.
+    `compare` follows each arm's curve; this compares the arms. Every gap is a
+    paired difference over the same held-out texts: two per-point intervals can
+    overlap while the paired difference excludes zero.
     """
     files = sorted(glob.glob(pattern), key=lambda f: order(Path(f).stem))
     points = [json.loads(Path(f).read_text(encoding="utf-8")) for f in files]
@@ -710,9 +637,8 @@ def arms(pattern: str, against: str = "A") -> int:
         if point["point"] != "base":
             curves.setdefault(arm_of(point), []).append(point)
 
-    # The point to keep, not the last one measured. An arm's Moore can improve
-    # to its final epoch and still be worse there than three epochs in, which is
-    # the whole reason for measuring a curve.
+    # Each arm is shown at its kept point. Moore can improve up to the last epoch
+    # and still be worse there than three epochs earlier.
     last: dict[str, dict] = {}
     cut_at: dict[str, str] = {}
     rejected: dict[str, str] = {}
@@ -726,9 +652,8 @@ def arms(pattern: str, against: str = "A") -> int:
                   "no answer to the current twelve questions, "
                   "collapse checks not applied")
         if chosen is None:
-            # Every arm may fail the exit criterion, which is itself a finding
-            # and not a reason to print nothing: the numbers are still
-            # the comparison. Show the last point measured, and say what it is.
+            # An arm may keep nothing. Its last point is still shown, and labelled
+            # as such.
             last[arm] = curve[-1]
             rejected[arm] = crossed or "?"
         else:
@@ -748,8 +673,8 @@ def arms(pattern: str, against: str = "A") -> int:
     print("  a gap is paired on the same held-out texts; * means the interval "
           "excludes zero")
 
-    # A curve of one or two points cannot show a peak, so "no signal crossed"
-    # means "not looked for" and must not read as "none happened".
+    # A curve of one or two points cannot show a peak, so say so rather than
+    # report that no signal was crossed.
     print()
     for arm in [against] + others:
         curve = curves[arm]
@@ -769,11 +694,8 @@ def arms(pattern: str, against: str = "A") -> int:
 
     width = 22
     print()
-    # The columns are NOT all at the same rank: a rejected arm shows its last
-    # point and a kept one shows its peak, which can be epochs apart. Naming the
-    # point under each arm puts that where the numbers are, instead of three
-    # lines above them where a reader compares 1.97 at epoch 0.2 against 1.28 at
-    # epoch 5 and calls the first arm worse.
+    # Arms can be shown at different steps (a rejected arm at its last point, a
+    # kept one at its best), so the point name is printed under each column.
     shown = [against] + others
     print(f"{'capability':22s}" + "".join(f"{a:>{width}s}" for a in shown))
     print(f"{'':22s}" + "".join(f"{last[a]['point']:>{width}s}" for a in shown))
@@ -788,9 +710,7 @@ def arms(pattern: str, against: str = "A") -> int:
                 row += f"{measured:>{width - 1}.4f}{mark}"
             print(row)
 
-    # Facts and echo are not bits per character and are reported apart: the echo
-    # is invisible to bpc, and the fact probe exists because a perplexity did
-    # not see a fact flip.
+    # Facts and echo are reported apart: bits per character see neither.
     print()
     row = f"  {'facts right':20s}"
     for arm in [against] + others:
@@ -804,9 +724,8 @@ def arms(pattern: str, against: str = "A") -> int:
         echo = last[arm].get("echo_conversation_moore")
         row += f"{'' if echo is None else f'{echo:.0%}':>{width}s}"
     print(row)
-    # Reported, never a rejection: what the start answered and this
-    # point does not answer any more. The count carries the conclusion, the
-    # per-item veto rejected every checkpoint on items that come back.
+    # Known facts this point no longer answers, reported only (see
+    # `forgotten`).
     if base is not None:
         known = {f["id"] for f in base["faits"] if f["note"] == "juste"}
         for arm in [against] + others:

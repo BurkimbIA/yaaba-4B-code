@@ -1,6 +1,5 @@
-"""The Moore detector and the collapse checks, on the cases that broke them.
-
-Each of these answers is a real one that an earlier version misclassified.
+"""The Moore detector and the collapse checks, on real answers that earlier
+versions got wrong.
 """
 
 from __future__ import annotations
@@ -14,16 +13,16 @@ LEXICON = frozenset(
 
 
 def test_moore_without_a_distinctive_letter_is_moore():
-    """The original defect: `has_unique_letter` alone called 392 Moore answers
-    French, because none carried ɛ ɩ ʋ or a tilde."""
+    """With the alphabet alone, 392 Moore answers were called French because none
+    had ɛ ɩ ʋ or a tilde.
+    """
     assert not moore.has_unique_letter("Maan bala, koosda bala.")
     assert moore.written_in_moore("Maan bala, koosda bala.", LEXICON)
     assert moore.written_in_moore("M ba Soaamb ne m ba Katre", LEXICON)
 
 
 def test_la_and_a_are_not_french_markers():
-    """Fixing the first defect brought the second: a French word list holding
-    `la`, `a` or `de` called `A yi.` French."""
+    """A French word list holding `la`, `a` or `de` called `A yi.` French."""
     for word in ("la", "a", "be", "to"):
         assert word not in moore.FRENCH, word
     assert moore.written_in_moore("A yi.", LEXICON)
@@ -43,8 +42,9 @@ def test_a_distinctive_letter_decides_alone():
 
 
 def test_without_a_lexicon_it_is_weaker_and_says_so():
-    """The fallback accepts any two words without a French marker. That is a
-    choice, and this test exists so nobody mistakes it for the real measure."""
+    """Without a lexicon, any two words with no French marker pass. This test
+    documents that weaker fallback.
+    """
     assert moore.written_in_moore("xyzzy plugh", None)
     assert not moore.written_in_moore("xyzzy plugh", LEXICON)
 
@@ -68,16 +68,18 @@ COLLAPSED = [
 
 
 def test_one_opening_for_twelve_questions_is_a_collapse():
-    """The defect bits per character cannot see: they are computed with teacher
-    forcing and never look at generation."""
+    """Bits per character cannot see this collapse: they are computed with teacher
+    forcing and never look at generation.
+    """
     distinct, largest = moore.openings(COLLAPSED)
     assert (distinct, largest) == (1, 12)
     assert not moore.speaks_to_each(COLLAPSED)
 
 
 def test_openings_count_two_words_not_one():
-    """`Ned sã`, `Ned fãa` and `Ned ka` are three openings of one mould. At one
-    word they merge into `Ned` and the real variety disappears."""
+    """`Ned sã`, `Ned fãa` and `Ned ka` are three openings of one mould; counted on
+    one word they merge into `Ned`.
+    """
     three = ["Ned sã n a.", "Ned fãa n b.", "Ned ka n c."]
     assert moore.openings(three) == (3, 1)
     assert moore.openings(three, words=1) == (1, 3)
@@ -85,22 +87,22 @@ def test_openings_count_two_words_not_one():
 
 
 def test_the_majority_is_the_line_and_it_is_tight():
-    """Six answers of twelve pass, seven do not. It is a decision, not a
-    measurement, and the nearest checkpoint that passes sits at five: the
-    margin is one answer."""
+    """Six answers of twelve with one opening pass, seven do not. The nearest real
+    checkpoint that passes has five, so the margin is one answer.
+    """
     twelve = lambda n: ["Ned sã x"] * n + [f"Opening{i} y" for i in range(12 - n)]  # noqa: E731
     assert moore.speaks_to_each(twelve(6))
     assert not moore.speaks_to_each(twelve(7))
 
 
 def test_no_answer_does_not_reject():
-    """An empty list is not a collapse, it is a missing measurement."""
+    """An empty list is a missing measurement and is not rejected."""
     assert moore.speaks_to_each([])
     assert moore.openings([]) == (0, 0)
 
 
 # The twelve real answers of `P2@6120 + SFT checkpoint-218` sampled at `T=1.0`,
-# seed 20260917. Four different questions receive the SAME whole sentence.
+# seed 20260917. Four different questions get the same whole sentence.
 T1_REAL = [
     "Waoogd-a soab wata ne bãane.",
     "Wẽn-zoɛtb wõosg ka paoogd ye.",
@@ -116,8 +118,8 @@ T1_REAL = [
     "Wʋm a goama la f ra gom ye.",
 ]
 
-# The twelve greedy answers of the SAME checkpoint. All distinct, all under one
-# opening.
+# The twelve greedy answers of the same checkpoint: all distinct, all under
+# one opening.
 GREEDY_REAL = [
     "Ned sã n maan woto, a paamda sũ-noogo.",
     "Ned sã n belg a to, a me yaa belsg soaba.",
@@ -135,9 +137,10 @@ GREEDY_REAL = [
 
 
 def test_the_two_gates_disagree_on_the_real_passes():
-    """The opening check rejects the pass where all twelve answers DIFFER, and
-    accepts the one where the same sentence comes back four times. That is why
-    the repeat check exists."""
+    """The opening check rejects the greedy pass, whose twelve answers all differ,
+    and accepts the sampled pass, which gives one sentence four times. The
+    repeat check catches the second.
+    """
     # greedy: twelve distinct sentences, one opening
     assert moore.repeats(GREEDY_REAL) == (12, 1)
     assert moore.openings(GREEDY_REAL) == (1, 12)
@@ -158,9 +161,9 @@ def test_the_repeat_check_changes_no_greedy_verdict():
 
 
 def test_the_repeat_check_can_fail_and_is_not_a_majority_rule():
-    """The line is TWO, not a majority: giving one sentence to two different
-    questions is not a weak answer, it is no answer to one of them. A check
-    that cannot fail checks nothing."""
+    """The threshold is two identical answers, not a majority: one sentence given
+    to two different questions leaves one of them unanswered.
+    """
     assert moore.answers_each(["a", "b", "c"])
     assert not moore.answers_each(["a", "a", "b", "c", "d", "e", "f", "g"])
     # and the majority rule of the opening check would let this through

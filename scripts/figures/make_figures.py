@@ -2,12 +2,11 @@
 
     python scripts/figures/make_figures.py
 
-Every point comes from `evaluation/`; nothing is typed in by hand. Arm colours
-are the validated four-slot categorical palette in fixed arm order, and every
-series also carries its own marker, so identity never rests on colour alone.
-Text is set in Latin Modern, the font of the PMLR paper, and embedded as
-TrueType (`pdf.fonttype` 42): matplotlib's default Type 3 fonts render blurred
-and are refused by some venues.
+Every point is read from `evaluation/`. Arms keep a fixed colour, from a
+colour-blind-checked four-colour palette, and each series has its own marker as
+well. Text is set in Latin Modern, the font of the PMLR paper, and embedded as
+TrueType (`pdf.fonttype` 42), because matplotlib's default Type 3 fonts render
+blurred and some venues refuse them.
 """
 
 from __future__ import annotations
@@ -47,7 +46,7 @@ RELEASED = 651
 # The PMLR text width, so the fonts below print at their stated size (ACL scales by 1.05).
 WIDTH = 6.0
 
-# ponytail: the path is MiKTeX's; elsewhere the figures fall back to the default serif.
+# The path is MiKTeX's; without it the figures use the default serif font.
 LM = Path.home() / "AppData/Local/Programs/MiKTeX/fonts/opentype/public/lm"
 if not (LM / "lmroman10-regular.otf").exists():
     print(f"warning: Latin Modern not found in {LM}, the figures will not match the paper font")
@@ -55,8 +54,7 @@ for face in ("regular", "italic", "bold"):
     if (LM / f"lmroman10-{face}.otf").exists():
         font_manager.fontManager.addfont(str(LM / f"lmroman10-{face}.otf"))
 
-# The French reading copy gets its own figures. A missing entry raises, so no label
-# stays in English by accident.
+# Labels for the French copy of the paper. A missing entry raises a KeyError.
 FRENCH = {
     "Mooré bits per character (log scale)": "bits par caractère, mooré (éch. log)",
     "parallel-French bits per character": "bits par caractère, français parallèle",
@@ -228,7 +226,7 @@ def figure_sft(french: bool = False) -> None:
     prefix, run = "P2-6120", "sft-P2-6120-20260924-0002"
     log = [json.loads(line) for line in
            (FINAL / f"{run}.progression.jsonl").open(encoding="utf-8")]
-    # 1306 is the end-of-run save, four steps after 1302: plotting both says nothing more.
+    # 1306 is the end-of-run save, four steps after 1302, so it is left out.
     steps = [r["pas"] for r in log if "eval_loss" in r and r["pas"] != 1306]
     loss = [r["eval_loss"] for r in log if "eval_loss" in r and r["pas"] != 1306]
     bpc = [measure(FINAL / f"{prefix}-checkpoint-{s}.json", "moore_humain") for s in steps]

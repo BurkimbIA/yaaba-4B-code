@@ -14,8 +14,8 @@ LoRA throughout.
 
 The evaluation items (the held-out texts, the 52 fact items, the 12 held-out
 questions and the generative probes) are not in this repository.
-Text that sits in plain view on GitHub ends up in training corpora, and a test
-set that has been trained on no longer measures anything. They are in the gated
+Text published in plain view can end up in training corpora, and a model trained
+on a test set can no longer be measured with it. The items are in the gated
 dataset above, which carries a canary string.
 
 ## What reruns from this repository alone
@@ -24,7 +24,7 @@ No GPU is needed for any of these.
 
 ```bash
 uv sync
-uv run pytest                                      # 30 tests
+uv run pytest                                      # 33 tests
 uv run python scripts/figures/make_figures.py      # the paper's three figures, into figures/
 uv run python scripts/measure/flores.py --table    # FLORES+ devtest chrF table
 uv run python scripts/measure/flores_bootstrap.py  # paired bootstrap between systems

@@ -1,45 +1,34 @@
 """Freeze each arm into an immutable parquet set, identified by its content.
 
-An arm used to be a **recipe**, resolved at training time. That is thrifty, and
-it is also why **an early run of arm `A` is no longer reproducible**: within
-two days the reservoir moved three times, to repair a leak, to top up a share,
-and to rebuild the recipes. The same recipe resolved later does not yield the
-mixture it yielded before, and nothing says so.
+An arm used to be a recipe, resolved at training time. That made an early run
+of arm `A` impossible to reproduce: within two days the source data changed
+three times (a leak repaired, a share topped up, the recipes rebuilt), and the
+same recipe then yielded another mixture without any warning. The recipe says
+how to compose; the frozen set records what the model saw, which is what lets
+two arms trained days apart be compared.
 
-A recipe says *how to compose*. A frozen set says *what was seen*. Both are
-needed, and only the second lets you compare two arms trained days apart.
-
-## HuggingFace format, S3 storage
-
-The file is a **parquet** readable by `datasets`, but it is deposited on S3 and
-not on the Hub. Two reasons: redistributing a derivative requires checking the
-licences of every register it is made of, which is not done; and nothing forces
-you to publish in order to freeze.
+The file is a parquet readable by `datasets`, stored on S3 rather than the
+Hub, since freezing does not require publishing and the licences of every
+source have not been checked for redistribution.
 
     import datasets
     arm = datasets.load_dataset("parquet", data_files="arm-A.parquet")["train"]
 
-## Identity is the content, not the date
-
 The folder name is the first twelve characters of the sha256 of the texts, in
-the order they will be seen. Two resolutions yielding the same mixture yield the
-same folder; two that differ yield two folders, and they cannot be confused. A
-timestamp does not say that: two different dates can carry the same content, and
-it is the content that matters.
+training order. The same mixture always gets the same folder, and different
+mixtures get different ones, which a timestamp would not guarantee.
 
     s3://burkimbia-store/text/moore-assistant/bras/A/<fingerprint>/
         data.parquet     the texts, in order
         carte.json       the recipe, the counts, the licences, the date
 
-A pointer `bras/A/dernier.json` names the latest fingerprint, so the notebook
-does not have to know it. **The S3 key names stay French**: they are already
-written, and renaming them would break every reader.
+The pointer `bras/A/dernier.json` names the latest fingerprint, so the notebook
+does not need to know it. The S3 key names are in French because readers of
+the existing files depend on them.
 
-## What the card must hold to be auditable
-
-The whole recipe, the count per share, the ratio obtained, the number of leaks
-found at freezing time, the list of licences, and the version of the scripts.
-Without that the parquet is a heap of bytes nobody can trace.
+The card holds what an audit needs: the recipe, the count per share, the ratio
+obtained, the leaks found at freezing time, the licences and the script
+version.
 
     python scripts/train/freeze_arms.py --arm B            # write, no deposit
     python scripts/train/freeze_arms.py --arm A --deposit
@@ -76,10 +65,7 @@ SHARE = {"moore.jsonl": "moore", "francais.jsonl": "francais",
 
 
 def licences() -> dict[str, str]:
-    """Licences per register, read from the manifest rather than copied.
-
-    A number copied is a number that goes wrong the day its source moves.
-    """
+    """Licences per source, read from the manifest so the card follows its changes."""
     manifest = ROOT / "data" / "produit" / "reinjection_manifeste.csv"
     if not manifest.exists():
         return {}
@@ -96,8 +82,8 @@ def freeze(arm: str, deposit: bool) -> int:
         (MIXTURE / "recettes" / f"{arm}.json").read_text(encoding="utf-8"))
     plan = mixture.plan(recipe)
 
-    # The held-out set is checked again **at freezing time**, because it is this
-    # file that will be seen, no longer the recipe.
+    # The held-out texts are checked again at freezing time, on the texts that
+    # will actually be trained on.
     held_out = load_held_out(ROOT / "evaluation" / "tenu_a_lecart.jsonl")
     loaded = mixture.load_recipe(recipe, MIXTURE, held_out)
     texts = loaded.texts
@@ -133,8 +119,8 @@ def freeze(arm: str, deposit: bool) -> int:
         label = SHARE.get(name, "?")
         per_share[label] = per_share.get(label, 0) + per_file[name]["tokens"]
 
-    # The card's keys stay French: they are read by tooling already deposited on
-    # S3 and by the licence page. Renaming them would break both.
+    # The card's keys stay in French: existing S3 tooling and the licence page
+    # read them.
     card = {
         "bras": arm,
         "empreinte": fingerprint,
@@ -175,8 +161,8 @@ def freeze(arm: str, deposit: bool) -> int:
                                   indent=2), encoding="utf-8")
     s3_store.upload_dir(pointer.parent, f"{REMOTE}/{arm}")
 
-    # **Read back from S3 what was just written, and compare the hash.**
-    # A deposit that announces itself is not a deposit that happened.
+    # Read back what was just written to S3 and compare the hash, since an upload
+    # that reports success can still serve a stale object.
     served = s3_store.matches(f"{uri}/data.parquet", folder / "data.parquet")
     if served is not True:
         print(f"  read back from S3: "

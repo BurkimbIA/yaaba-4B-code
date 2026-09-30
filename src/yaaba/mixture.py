@@ -1,9 +1,9 @@
 """Resolving a training arm: from a recipe, or from a frozen dataset.
 
-A recipe says *how* to compose; a frozen dataset says *what was seen*. Both are
-needed, and only the second lets two arms trained days apart be compared: the
-reservoir moved three times in as many days, and the same recipe resolved on
-either side of that does not yield the same mixture.
+A recipe says how to compose the mixture; a frozen dataset records what was
+seen. Only the frozen dataset lets two arms trained days apart be compared,
+because the source data changed three times in as many days and the same
+recipe then gave different mixtures.
 """
 
 from __future__ import annotations
@@ -62,19 +62,15 @@ class Arm:
 
 def witness(mixture: Path,
             exclude: str | tuple[str, ...] = ()) -> Iterator[dict]:
-    """The mixture, minus the registres the caller writes into it.
+    """The mixture, minus the `registre` values the caller writes into it.
 
-    Yields rather than returns: callers read it once, and a 303 000-row list of
-    dicts is 187 MB nobody needs to hold.
+    A generator: callers read it once, and a list of 303,000 dicts takes
+    187 MB.
 
-    An extractor that dedups against the mixture is judging itself as soon as
-    its own output has been poured back: its texts are in the witness, so on a
-    second run it reports them as already known and yields almost nothing. It
-    fails silently, because "already in the mixture" is a legitimate answer.
-
-    Measured on `nllb_mono`: without the exclusion, a rerun kept 3 305 lines
-    instead of 35 542. Three other extractors carried the same shape,
-    two of them with 99.5 % of their output already in the witness.
+    An extractor that deduplicates against the mixture must exclude its own
+    output, or a second run finds its texts already present and keeps almost
+    nothing, without any error. On `nllb_mono` a rerun kept 3,305 lines instead
+    of 35,542.
 
     `exclude` is the `registre` value the caller writes, or several of them.
     """
@@ -88,12 +84,10 @@ def witness(mixture: Path,
 
 
 def witness_keys(mixture: Path, exclude: str | tuple[str, ...] = ()) -> set[str]:
-    """`witness`, reduced to relaxed keys: what most extractors actually need.
+    """`witness` reduced to relaxed keys, which is what most extractors need.
 
-    A generator, so the set is the only thing held: going through a list first
-    cost 257 MB at peak and 16 s on a 303 000-row mixture, for a set that weighs
-    a quarter of that. An extractor pays this at startup, on a runtime that also
-    holds a 4 B model.
+    Built from the generator, so only the set is held in memory (a list first
+    cost 257 MB at peak on a 303,000-row mixture).
     """
     return {key(row["text"]) for row in witness(mixture, exclude)}
 
@@ -103,9 +97,9 @@ def plan(recipe: dict) -> dict[str, Source]:
     """Recipe -> one Source per file, deduplicated.
 
     A bilingual file appears twice in a recipe, once per language, but it is one
-    glued document: loading it twice would double the data and skew the ratio.
-    Two different takes on one file make the mixture depend on read order, so
-    that is an error rather than a choice.
+    document; loading it twice would double it and skew the ratio. Two
+    different takes on one file raise an error, since the result would depend
+    on read order.
     """
     sources: dict[str, Source] = {}
     for part in recipe["parts"].values():
@@ -144,10 +138,9 @@ def paired_keys(mixture: Path) -> set[str]:
 
 def load_recipe(recipe: dict, mixture: Path,
                 held_out: dict[str, set[str]] | None = None) -> Arm:
-    """Load an arm's texts in plan order, optionally re-checking for leaks.
+    """Load an arm's texts in plan order, optionally checking them again for leaks.
 
-    Checking here rather than only on the files is the verification that covers
-    what the model will actually see.
+    The check here runs on the texts the model will see, after composition.
     """
     sources = plan(recipe)
     paired = (paired_keys(mixture)
@@ -179,11 +172,10 @@ def load_recipe(recipe: dict, mixture: Path,
 
 
 def frozen_card(name: str, mixture: Path, cache: Path) -> dict | None:
-    """The frozen arm's card: counts, ratio, leaks, recipe. No data read.
+    """The frozen arm's card: counts, ratio, leaks, recipe. No data is read.
 
-    Verifying a frozen arm means reading its card, not re-resolving the recipe:
-    the card records what was frozen, and re-resolving needs mixture files a
-    fresh runtime does not have.
+    A frozen arm is verified from its card, since resolving the recipe again
+    needs mixture files that a fresh runtime does not have.
     """
     from . import s3
 
@@ -213,9 +205,8 @@ def load_frozen(name: str, mixture: Path, cache: Path) -> Arm | None:
 
     pointer = mixture / "bras" / name / "dernier.json"
     if not pointer.exists():
-        # A single key, not a prefix: `download_dir` would list `.../x.json/`
-        # and find nothing, then fall back to the recipe on a runtime that has
-        # no mixture files at all.
+        # A single key: `download_dir` would list `.../x.json/`, find nothing,
+        # and fall back to the recipe on a runtime that has no mixture files.
         pointer = cache / f"{name}-dernier.json"
         if not s3.download_file(f"{FROZEN_URI}/{name}/dernier.json", pointer):
             return None

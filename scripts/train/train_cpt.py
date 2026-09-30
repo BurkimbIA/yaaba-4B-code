@@ -1,18 +1,17 @@
 """Continued pre-training for one arm, resuming by default.
 
-    python scripts/train/train_cpt.py --arm A --verify   # here, no torch needed
+    python scripts/train/train_cpt.py --arm A --verify   # no torch needed
     python scripts/train/train_cpt.py --arm A --smoke    # 30 steps on GPU
     python scripts/train/train_cpt.py --arm A            # the run
     python scripts/train/train_cpt.py --arm A            # after a crash: same
     python scripts/train/train_cpt.py --arm A --fresh    # start over
     python scripts/train/train_cpt.py --arm P2 --resume-from P2-.../checkpoint-3172
 
-Resuming is the default because the wrong move should be the one that costs:
-when a runtime dies you rerun the same cell, and silently starting over would
-lose the hours already paid for without showing it.
+Resuming is the default: when a runtime dies, rerunning the same cell picks up
+where it stopped, and starting over takes an explicit `--fresh`.
 
-Setup lives in `configs/cpt.json` and is copied into the run directory, so a
-checkpoint always carries the settings that produced it.
+The setup lives in `configs/cpt.json` and is copied into the run directory, so
+a checkpoint carries the settings that produced it.
 """
 
 from __future__ import annotations
@@ -45,33 +44,26 @@ def recipe_for(arm: str) -> dict:
 
 
 def configure_wandb(arm: str, run: str, fingerprint: str) -> bool:
-    """Group runs by arm and reattach a resume to the same curve.
+    """Group runs by arm and attach a resumed run to the same curve.
 
-    Without a stable run id a 12 h run dying three times yields four
-    disconnected curves, and neither epochs nor arms can be compared. Since
-    resuming is the default, that is the normal case.
+    Without a stable run id, a long run that dies three times gives four
+    separate curves.
     """
     if os.environ.get("WANDB_DISABLED"):
         return False
-    # A key without the package fails at step 0, after the card is allocated and
-    # the mixture packed. Degrade instead: the S3 log stays the source of truth.
+    # A key without the package would fail at step 0, after the GPU is allocated
+    # and the mixture packed. Tracking is turned off instead; the S3 log remains.
     if importlib.util.find_spec("wandb") is None:
         print("W&B: key present but package missing, tracking off", file=sys.stderr)
         return False
 
-    # A cell that crashed leaves wandb alive in the kernel, and the next attempt
-    # inherits it: every variable set below is ignored and `init` fails on
-    # "run ID <the previous one> is in use", naming a run the caller never
-    # mentioned. Clear it here rather than after the card is allocated.
+    # A crashed cell leaves a wandb session in the kernel. The next attempt then
+    # ignores the variables below and `init` fails with "run ID ... is in use".
+    # `finish` closes the run but the session keeps the run id; `teardown` drops it.
+    # The run is finished first so it is not marked crashed.
     #
-    # `finish` alone does not do it. It closes the *run*; the run id is pinned
-    # by the *session* singleton, which is what says "your wandb session has
-    # already started". Only `teardown` drops that, and closing the run first
-    # keeps it from being marked crashed.
-    #
-    # And `find_spec` finding the package does not mean it imports: a partial
-    # install raises on `import wandb`, which is the same fatal-at-step-0 shape
-    # the check above exists to prevent. Reporting is not worth a run.
+    # A partial install can be found by `find_spec` and still fail on import, so the
+    # import is tried and tracking turned off if it fails.
     try:
         import wandb
 
@@ -99,10 +91,10 @@ def configure_wandb(arm: str, run: str, fingerprint: str) -> bool:
 
 
 def verify(arm: str, out: Path) -> int:
-    """Everything checkable without a GPU. Must print READY before paying.
+    """Everything that can be checked without a GPU. Prints READY when the run can start.
 
-    Prefers the frozen arm's card: it records what was frozen, and re-resolving
-    the recipe needs mixture files a fresh runtime does not have.
+    Reads the frozen arm's card when there is one, since resolving the recipe
+    needs mixture files that a fresh runtime does not have.
     """
     card = mixture.frozen_card(arm, MIXTURE, out)
     if card:
@@ -155,8 +147,8 @@ def verify(arm: str, out: Path) -> int:
     print(f"  {CONFIG['epoques']} epochs {hours:>10.1f} h   "
           f"{hours * 1.89:.2f} $ on A100")
 
-    # A drift can mean two very different things: an inconsistent recipe, or one
-    # asking for more than the reservoir holds, which the recipe already says.
+    # A drift means either an inconsistent recipe or a recipe asking for more than
+    # the source holds; the recipe already records the second case.
     short = {k: v for k, v in recipe.get("manque", {}).items() if v}
     if short:
         print("\n  recipe declares missing: "
@@ -171,12 +163,10 @@ def verify(arm: str, out: Path) -> int:
 def resume_named(name: str, out: Path) -> tuple[Path, str]:
     """Resume from a run named by hand: `<run>` or `<run>/checkpoint-N`.
 
-    Automatic resume asks S3 which runs exist, and a prefix listing there can be
-    stale for hours: `P2-20260902-1725` had four checkpoints deposited
-    and appeared in no listing, flat or delimited, while `head_object` on its
-    keys answered. The run restarted from zero, losing 2.8 epochs.
-
-    Naming the run skips the listing entirely: every lookup here is by key.
+    Automatic resume lists the runs on S3, and a prefix listing can be stale
+    for hours: one run with four stored checkpoints did not appear in any
+    listing while its keys answered `head_object`, and it restarted from zero.
+    A named run is looked up by key only.
     """
     run, _, point = name.strip("/").partition("/")
     folder = out / run
@@ -207,8 +197,8 @@ def resolve_run(arm: str, out: Path, fresh: bool,
                 resume_from: str = "") -> tuple[Path, str | None]:
     """Pick the run directory and the checkpoint to resume from.
 
-    Resolved before loading anything: the previous version read 322k documents
-    and packed 36 M tokens before discovering there was nothing to resume.
+    Done before loading any data, so a run with nothing to resume fails before
+    reading and packing the mixture.
     """
     if resume_from and not fresh:
         return resume_named(resume_from, out)
@@ -223,8 +213,8 @@ def resolve_run(arm: str, out: Path, fresh: bool,
             print(f"RESUMING locally from {resume}", flush=True)
             return folder, str(resume)
 
-        # A dead Colab runtime wipes /content, which is the normal case: if it
-        # had not died there would be nothing to resume.
+        # A dead Colab runtime wipes /content, so checkpoints to resume from come
+        # from S3.
         for name in reversed(s3.list_runs(RUNS_URI, f"{arm}-")):
             checkpoint = s3.latest_checkpoint(f"{RUNS_URI}/{name}")
             if not checkpoint:
@@ -233,10 +223,8 @@ def resolve_run(arm: str, out: Path, fresh: bool,
             s3.download_dir(f"{RUNS_URI}/{name}/{checkpoint[0]}",
                             folder / checkpoint[0])
 
-            # A checkpoint without `trainer_state.json` cannot be resumed: the
-            # Trainer raises before the first step, after the card is allocated
-            # and the mixture packed. Early runs uploaded the adapter alone,
-            # so this is not hypothetical.
+            # A checkpoint without `trainer_state.json` cannot be resumed; early
+            # runs uploaded the adapter alone.
             if not (folder / checkpoint[0] / s3.REQUIRED_TO_RESUME).exists():
                 print(f"  {name}/{checkpoint[0]}: no {s3.REQUIRED_TO_RESUME}, "
                       f"cannot resume from it (adapter kept for evaluation)",
@@ -280,9 +268,8 @@ def train(arm: str, epochs: int, out: Path, fresh: bool, upload: bool,
     run = folder.name
     uri = f"{RUNS_URI}/{run}"
 
-    # Two seconds, before the card is allocated. Uploads only warn when they
-    # fail, which is right for a blip mid-run and wrong for credentials that
-    # never worked: a run then trains for hours and leaves nothing.
+    # Check the credentials before the GPU is allocated; uploads only warn when
+    # they fail, so bad credentials would otherwise go unnoticed for hours.
     if upload and not smoke:
         why = s3.writable(uri)
         if why:
@@ -318,16 +305,15 @@ def train(arm: str, epochs: int, out: Path, fresh: bool, upload: bool,
                                                  dtype=torch.bfloat16,
                                                  device_map="auto")
     model.config.use_cache = False
-    # Frozen base weights mean the replayed forward pass starts from inputs that
-    # need no gradient, cutting the chain before LoRA. One line, and it only
-    # shows after the card is allocated.
+    # With frozen base weights and gradient checkpointing, the recomputed forward
+    # pass starts from inputs that need no gradient, which cuts the graph before
+    # LoRA. This line makes the inputs require gradients.
     model.enable_input_require_grads()
     model = get_peft_model(model, LoraConfig(task_type="CAUSAL_LM", **CONFIG["lora"]))
     model.print_trainable_parameters()
 
-    # Packing is done per file, so a sequence is homogeneous. It is the sampler's
-    # shuffle that makes a step see all five languages: the ratio holds over the
-    # whole mixture, not inside a window.
+    # Packing is done per file, so each sequence holds one source. The sampler's
+    # shuffle mixes sources within a step; the ratio holds over the whole mixture.
     steps_per_epoch = -(-len(packed) // (BATCH * ACCUM))
     total_steps = smoke or steps_per_epoch * epochs
     print(f"  {len(packed):,} sequences, {steps_per_epoch:,} steps/epoch, "
@@ -346,8 +332,8 @@ def train(arm: str, epochs: int, out: Path, fresh: bool, upload: bool,
                                          **logs}, ensure_ascii=False) + "\n")
 
     if smoke:
-        # Thirty steps are worth no W&B run, and without a key `wandb.init`
-        # blocks on stdin forever.
+        # A smoke run needs no W&B run, and without a key `wandb.init`
+        # waits on stdin.
         os.environ["WANDB_DISABLED"] = "true"
         print(f"SMOKE RUN: {smoke} steps, no checkpoint, no upload", flush=True)
 
@@ -360,9 +346,8 @@ def train(arm: str, epochs: int, out: Path, fresh: bool, upload: bool,
         num_train_epochs=epochs,
         per_device_train_batch_size=BATCH,
         gradient_accumulation_steps=ACCUM,
-        # Activation recomputation is the one throughput lever left: it costs
-        # 20 to 30 %. It is in the config because it is measurable, and because
-        # a checkpoint must carry the setting that produced it.
+        # Activation recomputation costs 20 to 30 % of throughput. It is a config
+        # value so a checkpoint records it.
         gradient_checkpointing=CONFIG["recalcul_activations"],
         gradient_checkpointing_kwargs={"use_reentrant": False},
         optim=CONFIG["optimiseur"],
@@ -371,9 +356,8 @@ def train(arm: str, epochs: int, out: Path, fresh: bool, upload: bool,
         warmup_steps=max(1, round(CONFIG["warmup_ratio"] * total_steps)),
         bf16=True,
         logging_steps=CONFIG["logging_steps"],
-        # Saves are paced on the runtime's life expectancy, not on the shape of
-        # training. One fifth of an epoch puts epoch boundaries exactly on saves
-        #.
+        # Saves are paced on how long a runtime tends to live rather than on the
+        # epochs.
         save_strategy="steps",
         save_steps=max(1, steps_per_epoch // CONFIG["sauvegardes_par_epoque"]),
         save_total_limit=CONFIG["save_total_limit_disque"],

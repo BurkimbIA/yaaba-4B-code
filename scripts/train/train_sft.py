@@ -1,34 +1,28 @@
 """The instruction stage, on the base alone or on a CPT arm.
 
-    python scripts/train/train_sft.py --start base --verify   # here, no torch
+    python scripts/train/train_sft.py --start base --verify   # no torch needed
     python scripts/train/train_sft.py --start A    --verify
     python scripts/train/train_sft.py --start A    --smoke    # 20 steps on GPU
     python scripts/train/train_sft.py --start A               # the run
     python scripts/train/train_sft.py --start A               # after a crash: same
 
-`--start base` is the control and it is not optional. `tengsoaba-4b` is the
-score to beat but it was trained on a different, far larger instruction
-set, so comparing it to `A + SFT` would confound the continued pre-training with
-the size of the instruction set. Running the same 12 702 turns on the base and on
-each arm isolates what the CPT actually bought.
+`--start base` is the control. Running the same instruction turns on the base
+and on each arm isolates what the continued pre-training added; a model trained
+on another, larger instruction set would mix the two effects.
 
-Setup lives in `configs/sft.json` and is copied into the run directory.
+The setup lives in `configs/sft.json` and is copied into the run directory.
 
-## Three things this stage can get silently wrong
+Three failures this stage guards against, none of which raises on its own:
 
-**The adapter loaded frozen.** `PeftModel.from_pretrained` defaults to
-`is_trainable=False`. A run then trains, shows a falling loss and learns
-nothing. Here the arm's adapter is *merged* rather than continued, so the trap
-does not apply, but the guard that catches it stays: trainable parameters are
-counted and zero raises.
-
-**The loss computed on the question.** Without a mask the model is trained to
-produce the prompt as much as the answer, which on `mos_mos` means training it
-to echo. Only the assistant tokens carry a label here, and a test checks it.
-
-**A turn silently truncated.** A long tale fills the window and its answer falls
-off the end, leaving an example with nothing to learn from. Such turns are
-dropped and counted, never truncated.
+- A frozen adapter. `PeftModel.from_pretrained` defaults to
+  `is_trainable=False`, and the run then shows a falling loss and learns
+  nothing. The arm's adapter is merged here rather than continued, and the
+  trainable parameters are counted anyway: zero raises.
+- Loss on the question. Without a mask the model also learns to produce the
+  prompt, which on `mos_mos` means learning to echo. Only assistant tokens
+  carry a label, and a test checks it.
+- Truncated turns. A long turn can push its answer out of the window. Such
+  turns are dropped and counted instead of truncated.
 """
 
 from __future__ import annotations
@@ -62,9 +56,8 @@ IGNORE = -100  # what the loss skips
 def turns(split: str = "train") -> list[dict]:
     """The assembled turns of one split, filtered to the chosen variants.
 
-    The variant says which language the question is in and which the answer is
-    in. Choosing them is an experimental choice, so it is read from the config
-    and never hardcoded here.
+    A variant gives the language of the question and of the answer. Which ones
+    to train on is an experimental choice, so it comes from the config.
     """
     keep = set(CONFIG["variantes"])
     chosen = []
@@ -77,14 +70,14 @@ def turns(split: str = "train") -> list[dict]:
 
 
 def encode(turn: dict, tokenizer, window: int = WINDOW) -> dict | None:
-    """One turn as ids and labels, or None if it does not fit.
+    """One turn as ids and labels, or None if it does not fit the window.
 
-    The prompt is templated twice: once without the answer to find where it
-    ends, once with. Everything before the answer is masked, so the loss only
-    ever sees what the model is meant to produce.
+    The prompt is templated twice, without and with the answer, to find where
+    the answer starts. Everything before it is masked, so the loss only sees
+    what the model should produce.
 
-    `enable_thinking=False` is not optional on Qwen3: the mode is on by default,
-    reasons in Chinese, and spends the whole budget.
+    Qwen3 needs `enable_thinking=False`: thinking is on by default, reasons in
+    Chinese and uses up the token budget.
     """
     messages = turn["messages"]
     if len(messages) < 2 or messages[-1]["role"] != "assistant":
@@ -113,18 +106,14 @@ def encode(turn: dict, tokenizer, window: int = WINDOW) -> dict | None:
 def start_from(start: str, out: Path) -> tuple[str, str | None]:
     """The base model id, and the adapter to merge into it, or None.
 
-    It is *merged*, so what trains afterwards is a fresh adapter over a fixed
-    starting point: the SFT stage stays identical whatever the start, which is
-    the only way the comparison says something about the CPT.
+    The adapter is merged, so the SFT stage trains a fresh adapter from a fixed
+    starting point and stays identical whatever the start. That is what lets
+    the comparison speak about the CPT.
 
-    **The last checkpoint is not the best one**, which is the whole reason for
-    measuring a curve. `C` turns between epoch 4 and epoch 5, on Moore and on the
-    facts alike, so taking its last point would carry an overfit into
-    the SFT stage and blame the result on the CPT recipe.
-
-    So an arm may name its point: `C@checkpoint-4820`. Without a point, the last
-    checkpoint of the most recent run is used, which is right for an arm whose
-    curve is still going down and wrong for one that has turned.
+    An arm may name its point, as in `C@checkpoint-4820`, because its last
+    checkpoint is not always its best: `C` turns between epoch 4 and epoch 5 on
+    Moore and on the facts. Without a point, the last checkpoint of the most
+    recent run is used.
     """
     if start == "base":
         return CONFIG["base"], None
@@ -143,8 +132,8 @@ def start_from(start: str, out: Path) -> tuple[str, str | None]:
     local = out / "depart" / f"{run}-{name}"
     if not (local / ADAPTER).exists():
         s3.download_dir(f"{CPT_URI}/{run}/{name}", local)
-    # Checked after the download, so a mistyped point fails here rather than
-    # inside `PeftModel.from_pretrained` twenty minutes of setup later.
+    # Checked right after the download, so a mistyped point fails here and not
+    # in `PeftModel.from_pretrained` after twenty minutes of setup.
     if not (local / ADAPTER).exists():
         raise SystemExit(f"{CPT_URI}/{run}/{name} has no {ADAPTER}")
     print(f"start: {CONFIG['base']} + {run}/{name} (step {step:,})", flush=True)
@@ -152,7 +141,7 @@ def start_from(start: str, out: Path) -> tuple[str, str | None]:
 
 
 def configure_wandb(start: str, run: str) -> bool:
-    """Same contract as the CPT stage, including closing a leftover session."""
+    """Same setup as the CPT stage, including closing a leftover session."""
     if os.environ.get("WANDB_DISABLED"):
         return False
     if importlib.util.find_spec("wandb") is None:
@@ -185,15 +174,13 @@ def configure_wandb(start: str, run: str) -> bool:
 
 
 def held_out_in(chosen: list[dict]) -> list[tuple[int, str, str, str]]:
-    """Turns whose text is in the evaluation instrument, with how they match.
+    """Turns whose text appears in the held-out evaluation texts, with how they match.
 
-    The CPT mixture is screened part by part (`heldout.TARGETS`); the SFT set
-    never was, and three of its 4 265 turns are word for word in the held-out
-    `moore_humain`, from `enquetes` and `spg_series`. Training on them and then
-    measuring on them would put memorisation into the final comparison.
-
-    An SFT turn belongs to no mixture part -- it is assembled from all of them
-    -- so it is checked against `EVERYTHING`, the widest control there is.
+    The CPT mixture is screened part by part (`heldout.TARGETS`). The SFT set
+    once was not, and three of its 4,265 turns were word for word in the
+    held-out `moore_humain`, which would have put memorisation into the final
+    comparison. An SFT turn comes from every part, so it is checked against
+    `EVERYTHING`.
     """
     guard = heldout.Guard(heldout.EVERYTHING,
                           heldout.load(ROOT / "evaluation" / "tenu_a_lecart.jsonl"))
@@ -211,9 +198,8 @@ def held_out_in(chosen: list[dict]) -> list[tuple[int, str, str, str]]:
 def start_missing(start: str) -> str | None:
     """Why the start cannot be resolved on S3, or None. No download, no GPU.
 
-    `verify` used to print READY without ever asking S3, so a checkpoint that
-    did not exist passed the check. In a notebook chaining six runs, finding out
-    at the fifth hour that one is missing costs the session.
+    Run by `verify`, so a missing checkpoint is caught before a notebook that
+    chains several runs reaches it.
     """
     if start == "base":
         return None
@@ -230,16 +216,12 @@ def start_missing(start: str) -> str | None:
 
 
 def unlisted_variants() -> dict[str, int]:
-    """Variants present in the set that `configs/sft.json` names nowhere.
+    """Variants present in the set that `configs/sft.json` does not name.
 
-    **A variant absent from `variantes` is dropped silently**, and that cost the
-    whole verbosity work: `fr_long` was invented by two builders and none of its
-    turns reached the run that was meant to train them. Nothing failed,
-    nothing warned; the turns simply were not there.
-
-    So an exclusion now has to be written down. A variant belongs either to
-    `variantes`, which trains it, or to `variantes_ecartees`, which is a
-    decision someone made and can defend. Anything else stops the run.
+    A variant missing from `variantes` is dropped without a warning; this once
+    removed every `fr_long` turn from the run meant to train them. So each
+    variant must be listed, either in `variantes` (trained) or in
+    `variantes_ecartees` (listed as excluded). Anything else stops the run.
     """
     known = set(CONFIG["variantes"]) | set(CONFIG.get("variantes_ecartees", ()))
     counts: dict[str, int] = {}
@@ -252,18 +234,16 @@ def unlisted_variants() -> dict[str, int]:
 
 
 def demo() -> None:
-    """The unlisted-variant guard, checked. A guard that cannot fail guards
-    nothing.
+    """Check that the unlisted-variant guard fires.
 
-    `verify` covers the rest of this file and needs the set on disk; this one
-    needs nothing, so it runs in `pytest` and in a hook.
+    `verify` covers the rest of this file and needs the set on disk; this check
+    only needs the config, so it runs in `pytest`.
     """
     kept = list(CONFIG["variantes"])
     try:
         # Every variant on disk is named somewhere, or `verify` would refuse.
         assert unlisted_variants() == {}, unlisted_variants()
-        # Drop one, and the guard must see exactly it. This is the shape of the
-        # defect: `fr_long` was in neither list and its turns vanished unsaid.
+        # Drop one variant from the config: the guard must report exactly that one.
         CONFIG["variantes"] = [v for v in kept if v != "fr_long"]
         seen = unlisted_variants()
         assert set(seen) == {"fr_long"}, seen
@@ -274,7 +254,7 @@ def demo() -> None:
 
 
 def verify(start: str) -> int:
-    """Everything checkable without a GPU. Must print READY before paying."""
+    """Everything that can be checked without a GPU. Prints READY when the run can start."""
     chosen = turns("train")
     held = turns("val")
     by_variant: dict[str, int] = {}
@@ -294,8 +274,8 @@ def verify(start: str) -> int:
     print(f"  {len(chosen):,} train turns, {len(held):,} held back for reading")
     print(f"  steps     {steps:>8,} per epoch, {steps * CONFIG['epoques']:,} total")
 
-    # A turn longer than the window is dropped, so the count belongs here, before
-    # the card is paid for, and not in a log nobody reads afterwards.
+    # Turns longer than the window are dropped, so they are counted here, before
+    # the GPU is paid for.
     longest = max((sum(len(m["content"]) for m in t["messages"]) for t in chosen),
                   default=0)
     print(f"  longest turn {longest:,} characters "
@@ -331,43 +311,23 @@ GRAINE_TENUES = 20260912
 
 
 def questions_tenues(combien: int = 12) -> list[dict]:
-    """The turns the exit criterion is read on: Moore questions, held back.
+    """The twelve held-out Moore questions the SFT exit criterion is read on.
 
-    Written here rather than in the notebook because three places need the same
-    twelve turns: the notebook that generates the answers, the review sheet that
-    collects the verdicts, and any later rerun. A rule copied into three files
-    is a rule that will differ in three files.
+    Defined here because the notebook that generates the answers, the review
+    sheet and any rerun all need the same twelve turns.
 
-    **The family is `expliquer_proverbe`, and that is the whole point.** The
-    criterion has been measured on three different item sets and none of them
-    could be graded:
+    They are `expliquer_proverbe` turns: the proverb is quoted in full and the
+    turn asks `võor yaa bõe?` (what does it mean). Two earlier choices could not
+    be graded. Turns that asked which proverb says a given line let a model
+    repeat the prompt. Question turns taken from broadcast transcripts
+    (`B sãn n kẽ n gʋʋls tɩ bõe?`) expected what only the interviewee knew.
 
-      - the first twelve turns in file order, 7 `condenser` and 5 `raconter`,
-        where the prompt carried a proverb-shaped line and asked which proverb
-        says it, so repeating the prompt was a defensible answer;
-      - the `repondre` turns carrying a question mark, which came from
-        broadcast and interview transcript: the question is a conversational
-        turn and the expected answer the next one, encoding what only the
-        interviewee knows. `B sãn n kẽ n gʋʋls tɩ bõe?` expects a list of proper
-        nouns from one show, and all four checkpoints echoed the question.
-
-    `expliquer_proverbe` was picked next because the proverb is quoted in full
-    and the turn asks `võor yaa bõe?`, what does it mean, so the answer looked
-    determinable from the prompt. **Measured, it is not**: the expected
-    gloss shares 18 % of its words with the proverb it explains, the level of
-    function words. It is a second maxim, one defensible reading among several,
-    and the four checkpoints recover their question two to four times more than
-    their reference, `checkpoint-872` worst of all. A reviewer holding that
-    reference crosses out any other correct gloss, so the item scores « landed
-    on the site's wording », not « answered relevantly ».
-
-    **These twelve therefore stay as the set that produced the numbers already
-    on disk, and nothing more.** Swapping the family a fourth time would repeat
-    what has failed three times: each problem was found by a speaker after the
-    fact, never by the code, and each replacement was chosen from whatever the
-    val set happened to hold. Of the eleven families there, only `titrer`
-    grades **without a reference** -- the text is in the prompt, so a speaker
-    judges whether the title fits it -- and its prompts run 275 words.
+    This set has a limit too. The reference gloss shares 18 % of its words with
+    the proverb, about the rate of function words, so it is one reading among
+    several, and a reviewer holding it can reject another correct gloss. The
+    set is kept because it produced the stored numbers. Of the val families,
+    only `titrer` can be graded without a reference, and its prompts run 275
+    words.
     """
     import random
 
@@ -380,11 +340,10 @@ def questions_tenues(combien: int = 12) -> list[dict]:
 
 
 def label(start: str) -> str:
-    """The start, as a run name: `C@checkpoint-4820` becomes `C-4820`.
+    """The start as a run name: `C@checkpoint-4820` becomes `C-4820`.
 
-    The point belongs in the name. Two SFT runs from `C` at epoch 4 and at
-    epoch 5 are two different experiments, and a name that hid the difference
-    would let the second resume from the first's checkpoints.
+    The point is part of the name, so two runs from `C` at different epochs
+    never resume from each other's checkpoints.
     """
     arm, _, point = start.partition("@")
     return f"{arm}-{point.rpartition('-')[2]}" if point else arm
@@ -393,16 +352,14 @@ def label(start: str) -> str:
 def resume_refused(state: dict, total_steps: int) -> str | None:
     """Why this checkpoint cannot continue under the current ceiling, or None.
 
-    A resume that crosses a change of set or of epoch count is invisible. Once,
-    `base` resumed an older run and trained **119 steps** on the repaired set,
-    while `P2` resumed a checkpoint at step 1,776 under a ceiling of 1,310 and
-    therefore trained **zero**. Nothing failed: transformers printed a mismatch
-    warning among the download bars and the cell reported both runs done.
+    A resume across a change of set or of epoch count raises nothing. Once,
+    `base` resumed an older run and trained 119 steps on the repaired set, and
+    `P2` resumed at step 1,776 under a ceiling of 1,310 and trained none;
+    transformers only printed a warning.
 
-    `trainer_state.json` carries the ceiling the resumed run was built with,
-    which is `steps_per_epoch * epochs`. It moves as soon as the set grows or
-    shrinks, or the epoch cap changes, so comparing it catches both without
-    fingerprinting the set separately.
+    `trainer_state.json` stores the ceiling the run was built with,
+    `steps_per_epoch * epochs`. It changes when the set grows or shrinks or
+    when the epoch cap changes, so comparing it catches both.
     """
     done = state.get("global_step", 0)
     before = state.get("max_steps")
@@ -495,12 +452,9 @@ def train(start: str, epochs: int, out: Path, fresh: bool, upload: bool,
     print(f"  {len(encoded):,} turns encoded, {dropped:,} dropped "
           f"(longer than {WINDOW:,} tokens, or malformed)", flush=True)
 
-    # The held-back split was loaded by `verify` to be counted and then thrown
-    # away, so one run produced **zero** evaluation points.
-    # Without it the only visible signal is the training loss, which falls at
-    # every epoch boundary whether the model generalises or memorises. That
-    # shape is readable only in hindsight; an evaluation loss says it while the
-    # card is still running.
+    # The held-back split gives the evaluation loss. The training loss drops at
+    # every epoch boundary whether the model generalises or memorises; the
+    # evaluation loss shows which while the run is going.
     held, held_dropped = prepare("val")
     print(f"  {len(held):,} turns held back for evaluation, "
           f"{held_dropped:,} dropped", flush=True)
@@ -510,7 +464,7 @@ def train(start: str, epochs: int, out: Path, fresh: bool, upload: bool,
     if adapter:
         from peft import PeftModel
 
-        # Merged, not continued: see the module docstring and `configs/sft.json`.
+        # Merged rather than continued: see the module docstring.
         model = PeftModel.from_pretrained(model, adapter).merge_and_unload()
     model.config.use_cache = False
     model.enable_input_require_grads()
@@ -518,7 +472,7 @@ def train(start: str, epochs: int, out: Path, fresh: bool, upload: bool,
 
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     if trainable == 0:
-        # A frozen adapter trains, shows a falling loss, and learns nothing.
+        # A frozen adapter shows a falling loss and learns nothing.
         raise SystemExit("no trainable parameter: the adapter loaded frozen")
     model.print_trainable_parameters()
 
@@ -573,21 +527,13 @@ def train(start: str, epochs: int, out: Path, fresh: bool, upload: bool,
         save_strategy="steps",
         save_steps=max(1, steps_per_epoch // CONFIG["sauvegardes_par_epoque"]),
         save_total_limit=CONFIG["save_total_limit_disque"],
-        # The evaluation lands **on** the save, not between two: that way each
-        # checkpoint carries the number that says whether it was worth keeping.
-        # One cadence rather than two also means one fewer knob to set wrong.
+        # Evaluation runs at each save, so every checkpoint carries its own
+        # evaluation loss.
         #
-        # `load_best_model_at_end` is here for one reason, and it is not the
-        # loading: it makes `save_total_limit` **exempt the argmin from the
-        # rotation**. Without it the cadences agree and the pruning still eats
-        # the best point, because the pruning keeps the LAST n, not the best.
-        # Measured on two runs of the same recipe: on the first the minimum was
-        # step 588 and survived; on the second it was step 591 and was deleted,
-        # leaving step 788 at eval 1.3036 against the 1.2649 that had actually
-        # been reached. A run produces a curve and the point is chosen by
-        # measuring; a curve whose lowest point is thrown away
-        # cannot be measured, and the loss is invisible: the run looks
-        # complete and every file is where it should be.
+        # `load_best_model_at_end` is set for its side effect on `save_total_limit`:
+        # the rotation then keeps the checkpoint with the lowest evaluation loss.
+        # Without it the rotation keeps the last n and can delete the best point
+        # (once step 591, at 1.2649, leaving step 788 at 1.3036).
         **({"eval_strategy": "steps",
             "eval_steps": max(1, steps_per_epoch // CONFIG["sauvegardes_par_epoque"]),
             "per_device_eval_batch_size": BATCH,
@@ -599,9 +545,8 @@ def train(start: str, epochs: int, out: Path, fresh: bool, upload: bool,
         remove_unused_columns=False,
     )
     if smoke:
-        # `load_best_model_at_end` goes with the saves: transformers refuses an
-        # evaluation cadence of `steps` with a save cadence of `no`, rightly,
-        # since there is no point to load.
+        # A smoke run saves nothing, and transformers refuses
+        # `load_best_model_at_end` without saves.
         settings |= {"max_steps": smoke, "save_strategy": "no",
                      "load_best_model_at_end": False,
                      "logging_steps": max(1, smoke // 5)}
@@ -625,8 +570,8 @@ def train(start: str, epochs: int, out: Path, fresh: bool, upload: bool,
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    # Not `choices=STARTS`: an arm may name its point, `C@checkpoint-4820`,
-    # because the last checkpoint is not the best one.
+    # Free text rather than `choices=STARTS`, because an arm may name its point,
+    # as in `C@checkpoint-4820`.
     parser.add_argument("--start", required=True, metavar="START",
                         help="'base' for the control, or a CPT arm to build on, "
                              "optionally with its point: C@checkpoint-4820")

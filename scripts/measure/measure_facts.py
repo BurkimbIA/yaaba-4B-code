@@ -1,69 +1,40 @@
-"""An automatically-scored factual probe, for what perplexity cannot see.
+"""An automatically scored fact probe, for what perplexity cannot see.
 
-Between `Qwen3-4B` and an earlier Moore fine-tune of it, French loses
-**0.5 %** of bits per character, which reads as "nothing". And the capital of
-Burkina Faso moves from Ouagadougou to Bobo-Dioulasso, in both languages.
+Between `Qwen3-4B` and an earlier Moore fine-tune of it, French bits per
+character moved by 0.5 %, yet the fine-tune placed the capital of Burkina Faso
+in Bobo-Dioulasso, in both languages. Perplexity averages surprise over a text
+and cannot see one fact flip. A person reading outputs saw it; this probe does
+that reading automatically.
 
-**Perplexity measures average surprise over a text; it cannot see that one
-precise fact flipped.** No threshold on the seven bits-per-character numbers
-would have caught that, and it was a human who saw it while reading outputs.
+Each item has a checkable answer and, apart from it, the known wrong answer:
 
-This file makes that reading automatic. Twenty items with a checkable answer,
-each carrying what counts as right **and what counts as the known trap**:
+    {"id": "...", "question": "...", "attendu": ["<right answer>"],
+     "piege": ["<known wrong answer>"]}
 
-    {"question": "Quelle est la capitale du Burkina Faso ?",
-     "attendu": ["ouagadougou"],
-     "piege":   ["bobo-dioulasso"]}
-
-## Why `piege` is a field of its own, separate from wrong
-
-A wrong answer is wrong in one of two ways: the model does not know, or the
-model learned something else. Telling them apart matters, because the second is
-a regression and the first is a gap. `bobo-dioulasso` instead of `ouagadougou`
-is not noise: it is the country's second city, so a *plausible* confusion that
+`piege` is its own field because a model can be wrong in two ways: it does not
+know, or it learned something else. The second is a regression. A plausible
+confusion, such as a country's second city given as its capital, is what
 training can install.
 
-## Three defects found by reading its first output
+Scoring (`yaaba.facts.score`) handles three cases found by reading the first
+outputs:
 
-None would have been visible from the total alone. It took going item by item.
+- An answer holding both the expected string and the trap ("X, no, Y", or "X
+  covers more than Y") is scored `ambigu` and left to a human, since a
+  substring match cannot tell a rebuttal from a retraction.
+- Strings match on word boundaries, so "36" does not match "360".
+- The token budget is 320, because 120 tokens cut step-by-step arithmetic
+  before the result.
 
-**The trap was tested before the expected answer, and then after, and neither
-is right.** Qwen3 base answers "the largest ocean is the Pacific Ocean. It
-covers more than the Atlantic...": a right answer, marked as a trap because it
-mentions the Atlantic in order to rule it out. Flipping the order fixes that
-one and breaks the other: "Ouagadougou, no, Bobo-Dioulasso" would score right.
-A substring matcher cannot tell a rebuttal from a retraction, so an answer
-holding both strings is now scored `ambigu` and read by a human. Picking an
-order silently is how the two scorers of this repo disagreed for weeks about
-the same answer, each with a written justification.
-
-**Substring search had no word boundary.** tengsoaba-1.7b answers "24 x 15 =
-360", which is right, and "36" is a substring of "360". Numeric traps are now
-compared with a boundary.
-
-**120 tokens cut long-form arithmetic short.** "Pour calculer 347 + 285, on
-commence par les unites : 7 + 5 = 12..." and end of output: counted wrong, while
-nothing said the model had erred. Raised to 320.
-
-These are defects of measurement, not of models, and they skewed the first table
-in both directions.
-
-## What this probe does not do
-
-It looks for a string in the answer. That is coarse, and it errs both ways: a
-right answer phrased differently counts as wrong, and an answer quoting the
-right word inside a sentence that negates it counts as right. The score is
-therefore not a knowledge grade, **it is a flip detector**: what matters is that
-it is computed identically before and after, on the same items, and that an item
-going from right to wrong is visible.
-
-The items are deliberately simple and checkable. None calls for specialist
-knowledge, and that is the point: we are not measuring the model's erudition, we
-are watching that it does not lose what it knew.
+The score detects flips and is not a knowledge grade: a right answer phrased
+differently counts as wrong, and a negated mention counts as right. It is
+computed the same way before and after training, on the same items. The items
+are simple and checkable, since the probe only watches that the model keeps
+what it knew.
 
     python scripts/measure/measure_facts.py    # prints the Colab cell
 
-Writes `evaluation/faits_resultats.json` from the runtime.
+The cell writes `evaluation/faits_resultats.json` on the runtime.
 """
 
 CELL = r'''
@@ -103,11 +74,9 @@ def present(needle, haystack):
 def judge(answer, item):
     """juste / piege / ambigu / faux, the same four `src/yaaba/facts.py` uses.
 
-    **No ordering is right, and picking one silently is the bug.** Testing the
-    trap first scored "the Pacific Ocean covers more than the Atlantic" as a
-    regression; testing the expected value first would score "Ouagadougou, no,
-    Bobo-Dioulasso" as correct. A substring matcher cannot tell the two apart,
-    so when both strings are present it says so.
+    No order of tests is right: testing the trap first scores "X covers more
+    than Y" as a regression, and testing the expected answer first scores "X,
+    no, Y" as right. An answer holding both strings is scored `ambigu`.
 
     (The cell cannot import the package, it runs on a bare runtime, so this
     mirrors `yaaba.facts.score` with the numeric word boundary added.)
@@ -135,8 +104,8 @@ for role, name in MODELS.items():
     rows, counts = [], {"juste": 0, "piege": 0, "ambigu": 0, "faux": 0}
     for item in facts:
         message = [{"role": "user", "content": item["question"]}]
-        # Qwen3 needs the chat template and thinking off; other families do not
-        # take `enable_thinking`, hence the ladder rather than one call.
+        # Qwen3 needs the chat template with thinking off; other model families do
+        # not accept `enable_thinking`, hence the fallbacks.
         try:
             prompt = tokenizer.apply_chat_template(
                 message, tokenize=False, add_generation_prompt=True,
@@ -170,15 +139,15 @@ for role, name in MODELS.items():
 json.dump(everything, open("evaluation/faits_resultats.json", "w", encoding="utf-8"),
           ensure_ascii=False, indent=1)
 
-# --- the table, and above all the flips ----------------------------------
+# --- the table, then the flips -------------------------------------------
 print(f"\n\n{'model':18s} {'right':>7s} {'wrong':>7s} {'trap':>7s} {'unclear':>8s}")
 for role, data in everything.items():
     counts = data["compte"]
     print(f"{role:18s} {counts['juste']:>7} {counts['faux']:>7} "
           f"{counts['piege']:>7} {counts['ambigu']:>8}")
 
-# What actually matters: which items the base model gets right and a trained
-# model gets wrong. That is what a regression is.
+# Items the base model gets right and a trained model gets wrong: the
+# regressions.
 base = {row["id"]: row["verdict"] for row in everything["qwen3_4b_base"]["lignes"]}
 for role, data in everything.items():
     if role == "qwen3_4b_base":
@@ -206,7 +175,6 @@ if __name__ == "__main__":
 
     print(__doc__)
     print("--- cell to paste into Colab ---")
-    # The cell is a literal, so the budget cannot be imported inside it. It is
-    # substituted here instead, so the number lives in one place even though
-    # it ends up running in another runtime.
+    # The cell is a string literal and cannot import the budget, so the value is
+    # substituted here and stays defined in one place.
     print(CELL.replace("__BUDGET__", str(BUDGET)))

@@ -1,21 +1,20 @@
-"""Trainer callback that persists checkpoints as they are written.
+"""Trainer callback that uploads checkpoints as they are written.
 
-Kept apart from `yaaba.s3` so that module stays importable without transformers.
+Kept apart from `yaaba.s3` so that module imports without transformers.
 
-Two kinds of save, for two different purposes. *Interval* saves exist so a dead
-runtime does not cost hours; only the newest is kept. *Epoch* saves are the
-material of the measurement curve; all are kept, minus their optimizer
-state, since evaluation never resumes from them.
+There are two kinds of save. Interval saves protect against a dead runtime,
+and only the newest is kept. Epoch saves make up the measurement curve; all are
+kept, without their optimizer state, since evaluation never resumes from them.
 
-An epoch save is the **first save landing in a new epoch**, not a save falling
-exactly on the boundary: with 1,201 steps per epoch and a save every 219, no
-save ever falls on a boundary, and a rule asking for one keeps nothing.
+An epoch save is the first save that lands in a new epoch. Saves rarely fall
+exactly on a boundary: with 1,201 steps per epoch and a save every 219, none
+does.
 
-Keeping only the first save of each epoch is still wrong while the curve is
-falling, because that save is the worst of its epoch. With 655 steps per epoch
-and a save every 218, the end-of-first-epoch save, nearly always the minimum of
-the evaluation loss, is exactly the one such a rule deletes. So `keep_all`
-defaults to True: every save is kept, with its optimizer state pruned.
+While the curve is still falling, the first save of an epoch is its worst one.
+With 655 steps per epoch and a save every 218, keeping only first saves would
+delete the end of the first epoch, which is usually the lowest evaluation
+loss. So `keep_all` defaults to True: every save is kept, with its optimizer
+state pruned.
 """
 
 from __future__ import annotations
@@ -26,15 +25,15 @@ from . import s3
 
 
 class CheckpointUploader:
-    """Upload each checkpoint to `base_uri` the moment the Trainer writes it.
+    """Upload each checkpoint to `base_uri` as soon as the Trainer writes it.
 
     Args:
         base_uri: `s3://.../cpt/<run>`; empty disables every upload.
-        log: training log, uploaded on every logging step because it is small
-            and makes the run observable from outside the runtime.
+        log: training log, uploaded at every logging step so the run can be
+            followed from outside the runtime.
         steps_per_epoch: marks which saves open a new epoch. 0 keeps all.
-        keep_all: keep every save instead of rotating the interval ones.
-        False restores the old behaviour.
+        keep_all: keep every save. False keeps the epoch saves and only the
+            newest interval save.
     """
 
     def __init__(self, base_uri: str, log: Path | None = None,
@@ -108,15 +107,15 @@ def callback(base_uri: str, log: Path | None = None, steps_per_epoch: int = 0,
 
 
 def by_eval(run_uri: str) -> tuple[str, int, float] | None:
-    """The kept checkpoint whose evaluation loss is lowest.
+    """The kept checkpoint with the lowest evaluation loss.
 
-    The epoch count is a ceiling and the checkpoint is chosen by measuring the
-    curve. The most trained checkpoint is often not the best one: on one run the
-    evaluation loss bottomed at 1.2643 after one epoch and climbed to 1.4197 by
-    the third while the training loss fell from 1.01 to 0.57.
+    The epoch count is a ceiling, and the checkpoint is chosen on the measured
+    curve. On one run the evaluation loss bottomed at 1.2643 after one epoch
+    and rose to 1.4197 by the third, while the training loss fell from 1.01 to
+    0.57.
 
-    The answer is the argmin over the checkpoints whose weights still exist on
-    S3: a step can be the curve's minimum and have no weights left to load.
+    Only checkpoints whose weights still exist on S3 are considered, since the
+    minimum of the curve may have been deleted.
 
     Returns `(name, step, eval_loss)`, or None when the run logged no
     evaluation.
@@ -149,8 +148,7 @@ def demo() -> None:
     assert opening == [219, 1314, 2409, 3723, 4818], opening
 
     # While the curve still descends, the first save of an epoch is its worst.
-    # Keeping only those kept 218, 872 and 1310 and discarded the minimum at 654,
-    # hence `keep_all`.
+    # Keeping only those would keep 218, 872 and 1310 and drop the minimum at 654.
     saved = [218, 436, 654, 872, 1090, 1308, 1310]
     first_only = CheckpointUploader("", steps_per_epoch=655, keep_all=False)
     assert [s for s in saved if first_only.opens_an_epoch(s)] == [218, 872, 1310]

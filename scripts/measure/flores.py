@@ -1,17 +1,16 @@
 """FLORES+ devtest chrF, French to Moore and back, for one model.
 
     python scripts/measure/flores.py --name qwen3-4b                        # on GPU
-    python scripts/measure/flores.py --name P2+sft --start P2@checkpoint-6120 \
-        --sft sft-P2-6120-20260907-0700/checkpoint-1191
-    python scripts/measure/flores.py --table                                # here
+    python scripts/measure/flores.py --name P2+sft --start P2@checkpoint-6120 --sft sft-P2-6120-20260907-0700/checkpoint-1191
+    python scripts/measure/flores.py --table                                # no GPU
 
-The paper's one public benchmark. Every other number in this repo is ours:
-bits per character on our held-out texts, our facts, our probes. FLORES+ is the
-only published set with `mos_Latn`, and none of its 2,009 Moore sentences is in
-the training mix, so a reviewer can check it without trusting us.
+FLORES+ is the one public benchmark in the paper; the other numbers come from
+our own held-out texts, facts and probes. It is the only published set with
+`mos_Latn`, and none of its 2,009 Moore sentences is in the training mix, so
+anyone can check these numbers.
 
-The prompts are two the SFT set actually contains, so no model is asked in a
-wording it never saw. The base model is asked the same way: it is the floor.
+The two prompts are wordings the SFT set contains. The base model gets the same
+prompts and gives the floor.
 """
 
 from __future__ import annotations
@@ -37,7 +36,7 @@ RESULTS_URI = "s3://burkimbia-store/text/moore-assistant/flores"
 
 
 def pairs(french: list[dict], moore: list[dict]) -> list[tuple[str, str]]:
-    """(french, moore) aligned by FLORES id, never by line order."""
+    """(french, moore) pairs aligned by FLORES id rather than by line order."""
     by_id = {row["id"]: row["text"] for row in moore}
     missing = [row["id"] for row in french if row["id"] not in by_id]
     if missing:
@@ -47,8 +46,8 @@ def pairs(french: list[dict], moore: list[dict]) -> list[tuple[str, str]]:
 
 def first_line(reply: str) -> str:
     """The translation, without what a chat model adds after it."""
-    # ponytail: FLORES sentences are one line each, so anything past the first
-    # line is commentary. A model that wraps the answer in a preamble loses here.
+    # FLORES sentences are one line each, so anything after the first line is
+    # commentary. A model that puts a preamble first loses here.
     for line in reply.strip().splitlines():
         if line.strip():
             return line.strip().strip('"«» ')
@@ -112,8 +111,8 @@ def run(name: str, start: str, sft: str | None, batch: int, budget: int) -> Path
         checkpoint = str(work / "sft" / sft.replace("/", "-"))
         if not Path(checkpoint, train_sft.ADAPTER).exists():
             s3.download_dir(f"{SFT_URI}/{sft}", Path(checkpoint))
-    # `load` refuses an SFT point without its socle by folder name; ours is
-    # renamed, so the check is ours to make.
+    # `load` recognises an SFT point by its folder name, and this folder is
+    # renamed, so the socle check is done here.
     if sft and start != "base" and not socle:
         raise SystemExit("an SFT point on an arm needs its CPT socle")
     model, tokenizer, _ = load(checkpoint, socle)
@@ -132,13 +131,13 @@ def run(name: str, start: str, sft: str | None, batch: int, budget: int) -> Path
     OUT.mkdir(parents=True, exist_ok=True)
     path = OUT / f"{name.replace('+', '_').replace('/', '_')}.json"
     path.write_text(json.dumps(result, ensure_ascii=False, indent=1), encoding="utf-8")
-    # Out of the runtime at once: a Colab restart erases what stays there.
+    # Upload right away: a Colab restart erases the runtime's disk.
     s3.upload_file(path, f"{RESULTS_URI}/{path.name}")
     return path
 
 
 def in_target_language(hypothesis: str, direction: str) -> bool:
-    """Whether the output is in the language asked for, not left in the source one."""
+    """Whether the output is in the requested language rather than left in the source one."""
     from yaaba.moore import written_in_moore
 
     return written_in_moore(hypothesis) == (direction == "french_to_moore")

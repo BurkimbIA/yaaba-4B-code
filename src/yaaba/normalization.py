@@ -1,7 +1,7 @@
 """Unicode normalization shared by every path that compares two texts.
 
-One table, one place. Three diverging copies once let seven held-out verses stay
-in training because `«` was missing from all of them.
+It is defined once because separate copies drifted: seven held-out verses
+stayed in training when `«` was missing from all three copies of the table.
 """
 
 from __future__ import annotations
@@ -10,9 +10,9 @@ import re
 import unicodedata
 from typing import Final
 
-# Attested confusables plus typographic variants. Hyphens are unified but never
-# removed: 47.4 % of Moore texts carry a compound word. Tone marks are
-# combining and meaning-bearing, so NFC attaches them rather than stripping.
+# Confusables seen in the corpus, plus typographic variants. Hyphens are
+# unified and kept, since 47.4 % of Moore texts contain a compound word. Tone
+# marks carry meaning; NFC attaches them to their letter.
 CONFUSABLES: Final = str.maketrans({
     "ű": "ũ", "û": "ũ", "ɑ": "a", "ɡ": "g", "ʊ": "ʋ", "ʉ": "ʋ", "ε": "ɛ", "ι": "ɩ",
     "‐": "-", "‑": "-", "–": "-", "—": "-",
@@ -34,7 +34,7 @@ def clean(text: str) -> str:
 def key(text: str) -> str:
     """Relaxed comparison key: case, punctuation and whitespace erased.
 
-    Use to *verify* a removal, never to perform one.
+    For checking a removal. Removal itself uses exact text.
     """
     folded = unicodedata.normalize("NFC", str(text)).casefold()
     return _NON_WORD.sub("", folded)
