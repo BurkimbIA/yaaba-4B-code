@@ -260,11 +260,17 @@ def resolve_run(arm: str, out: Path, fresh: bool,
 def train(arm: str, epochs: int, out: Path, fresh: bool, upload: bool,
           smoke: int, from_recipe: bool, resume_from: str = "") -> int:
     import gc
+
     import numpy as np
     import torch
     from peft import LoraConfig, get_peft_model
-    from transformers import (AutoModelForCausalLM, Trainer, TrainerCallback,
-                              TrainingArguments, default_data_collator)
+    from transformers import (
+        AutoModelForCausalLM,
+        Trainer,
+        TrainerCallback,
+        TrainingArguments,
+        default_data_collator,
+    )
 
     gc.collect()
     if torch.cuda.is_available():

@@ -33,7 +33,7 @@ it is the content that matters.
 
 A pointer `bras/A/dernier.json` names the latest fingerprint, so the notebook
 does not have to know it. **The S3 key names stay French**: they are already
-written, and renaming them would break every reader (see `docs/GLOSSARY.md`).
+written, and renaming them would break every reader.
 
 ## What the card must hold to be auditable
 
@@ -57,8 +57,10 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
-from yaaba import mixture, packing, s3 as s3_store  # noqa: E402
-from yaaba.heldout import TARGETS, load as load_held_out  # noqa: E402
+from yaaba import mixture, packing  # noqa: E402
+from yaaba import s3 as s3_store
+from yaaba.heldout import TARGETS  # noqa: E402
+from yaaba.heldout import load as load_held_out
 
 ROOT = Path(__file__).resolve().parents[2]
 MIXTURE, OUT = ROOT / "melange", ROOT / "melange" / "bras"

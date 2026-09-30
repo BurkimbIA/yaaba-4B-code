@@ -537,9 +537,11 @@ def keepable(base: dict, curve: list[dict],
     eligible: list[dict] = []
     skipped: list[tuple[str, str]] = []
     earlier = base
-    best = (lambda: min(eligible,
-                        key=lambda p: p["mesures"]["moore_humain"]["bits_par_caractere"])
-            if eligible else None)
+
+    def best() -> dict | None:
+        return min(eligible, key=lambda p: p["mesures"]["moore_humain"]["bits_par_caractere"],
+                   default=None)
+
     for point in curve:
         if [m for m in marks_for(base, earlier, point, known)
                 if m != NOT_COMPARABLE]:

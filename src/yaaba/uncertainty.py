@@ -39,7 +39,8 @@ from __future__ import annotations
 
 import math
 import random
-from typing import Final, Iterable, NamedTuple
+from collections.abc import Iterable
+from typing import Final, NamedTuple
 
 # Fixed, so an interval recomputed tomorrow is the interval quoted today.
 SEED: Final = 20260831

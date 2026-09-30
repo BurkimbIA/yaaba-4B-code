@@ -10,7 +10,8 @@ from __future__ import annotations
 import collections
 import re
 import unicodedata
-from typing import Final, Iterable
+from collections.abc import Iterable
+from typing import Final
 
 # 25 letters plus five nasals, per *Moor ɡom wʋɡbo*, CIER de Guiè (2023).
 ALPHABET: Final[frozenset[str]] = frozenset(

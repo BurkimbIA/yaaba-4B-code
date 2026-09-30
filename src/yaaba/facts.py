@@ -25,8 +25,7 @@ import unicodedata
 from typing import Final
 
 # The values are data: they are written into evaluation JSON already on disk and
-# read back by `compare`. They stay French for the same reason the S3 card keys
-# do (see `docs/GLOSSARY.md`).
+# read back by `compare`, so they stay French like the other stored keys.
 RIGHT: Final = "juste"
 TRAPPED: Final = "piege"        # it learned something else
 UNCLEAR: Final = "ambigu"       # both strings present; a matcher cannot tell
