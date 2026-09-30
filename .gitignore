@@ -6,4 +6,4 @@ __pycache__/
 *.bbl
 *.blg
 .pytest_cache/
-figures/
+/figures/
