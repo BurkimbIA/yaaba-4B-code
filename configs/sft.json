@@ -1,0 +1,43 @@
+{
+  "_note": "Instruction-tuning setup, read by scripts/train/train_sft.py. A fresh LoRA adapter is trained on top of the start (the base, or the base merged with a CPT arm's adapter). The model answers in the language of the question, hence the kept variants. The epoch count is a ceiling: yaaba.checkpoints.by_eval picks the checkpoint.",
+  "base": "Qwen/Qwen3-4B",
+  "jeu": "moore_assistant_sft.jsonl",
+  "variantes": [
+    "fr_fr",
+    "fr_long",
+    "mos_mos",
+    "traduction",
+    "correction"
+  ],
+  "fenetre": 2048,
+  "lot": 4,
+  "accumulation": 8,
+  "recalcul_activations": true,
+  "optimiseur": "adamw_torch_fused",
+  "lora": {
+    "r": 32,
+    "lora_alpha": 64,
+    "lora_dropout": 0.0,
+    "target_modules": [
+      "q_proj",
+      "k_proj",
+      "v_proj",
+      "o_proj",
+      "gate_proj",
+      "up_proj",
+      "down_proj"
+    ]
+  },
+  "learning_rate": 0.0001,
+  "lr_scheduler_type": "cosine",
+  "warmup_ratio": 0.03,
+  "epoques": 2,
+  "sauvegardes_par_epoque": 3,
+  "logging_steps": 10,
+  "save_total_limit_disque": 2,
+  "projet_wandb": "moore-assistant-sft",
+  "variantes_ecartees": [
+    "fr_mos",
+    "mos_fr"
+  ]
+}

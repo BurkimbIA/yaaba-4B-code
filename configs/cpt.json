@@ -1,0 +1,32 @@
+{
+  "_note": "Continued pre-training setup, read by scripts/train/train_cpt.py and copied into each run folder so a checkpoint carries the settings that produced it. The epoch count is a ceiling: the checkpoint is chosen on the measured curve.",
+  "base": "Qwen/Qwen3-4B",
+  "fenetre": 1024,
+  "lot": 8,
+  "accumulation": 4,
+  "recalcul_activations": true,
+  "optimiseur": "adamw_torch_fused",
+  "lora": {
+    "r": 32,
+    "lora_alpha": 64,
+    "lora_dropout": 0.0,
+    "target_modules": [
+      "q_proj",
+      "k_proj",
+      "v_proj",
+      "o_proj",
+      "gate_proj",
+      "up_proj",
+      "down_proj"
+    ]
+  },
+  "learning_rate": 0.0001,
+  "lr_scheduler_type": "cosine",
+  "warmup_ratio": 0.03,
+  "epoques": 5,
+  "sauvegardes_par_epoque": 15,
+  "logging_steps": 25,
+  "save_total_limit_disque": 2,
+  "debit_mesure_tokens_s": 3901,
+  "projet_wandb": "moore-assistant-cpt"
+}
