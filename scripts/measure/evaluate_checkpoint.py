@@ -569,7 +569,12 @@ def gap(before: dict, after: dict, capability: str) -> uncertainty.Interval | No
         return None
 
 
-def compare(pattern: str) -> int:
+def compare(pattern: str, answers: dict[tuple[str, str], list[str]] | None = None) -> int:
+    """The curve of each arm, and where it should stop. Non-zero if an arm keeps
+    nothing.
+
+    `answers` defaults to `criterion_answers()`, which needs the gated set.
+    """
     files = sorted(glob.glob(pattern), key=lambda f: order(Path(f).stem))
     if not files:
         print(f"no checkpoint measured: {pattern}", file=sys.stderr)
@@ -627,95 +632,55 @@ def compare(pattern: str) -> int:
     known = {f["id"] for f in base["faits"] if f["note"] == "juste"}
     print(f"\nSIGNALS  (reference {base['point']}, {len(known)} facts right)")
 
-    # The overfitting signal reads a curve, and a curve belongs to one arm. All
-    # arms write their points into the same directory, so pairing by position in
-    # the sorted list splices B's last point onto C's first. The
-    # predecessor of a point is the previous point OF ITS OWN ARM.
-    previous_of: dict[str, dict] = {}
-    first_crossed = None
+    # A curve belongs to one arm. All arms write their points into the same
+    # directory, so the predecessor of a point is the previous point OF ITS OWN
+    # ARM, never the previous one in the sorted list.
+    curves: dict[str, list[dict]] = {}
     for point in points[1:]:
-        arm = arm_of(point)
-        earlier = previous_of.get(arm)
-        previous_of[arm] = point
-        if earlier is None:
-            earlier = base          # the first point of an arm is judged against base
-        current = point["mesures"]["moore_humain"]["bits_par_caractere"]
-        previous = earlier["mesures"]["moore_humain"]["bits_par_caractere"]
-        marks = []
-        # A rise the sample supports, not any rise: comparing point
-        # estimates makes the noise floor the stop criterion.
-        rise = gap(earlier, point, "moore_humain")
-        if rise is None:
-            if current >= previous:
-                marks.append(f"overfitting? (bpc {previous:.4f} -> {current:.4f}, "
-                             "no interval: re-measure)")
-        elif rise.low > 0:
-            marks.append(f"overfitting (bpc {rise.value:+.4f} "
-                         f"[{rise.low:+.4f}, {rise.high:+.4f}])")
-        # Only `piege` rejects; `faux` is counted and printed.
-        verdicts = {f["id"]: f["note"] for f in point["faits"]}
-        if not same_fact_budget(base, point):
-            # Counting these would measure the token budget, not the model.
-            marks.append(NOT_COMPARABLE)
-            verdicts = {}
-        lost = sorted(i for i in known if verdicts.get(i) == "piege")
+        curve = curves.setdefault(arm_of(point), [])
+        earlier = curve[-1] if curve else base
+        curve.append(point)
+        verdicts = ({f["id"]: f["note"] for f in point["faits"]}
+                    if same_fact_budget(base, point) else {})
         gone = forgotten(known, verdicts)
         unclear = sorted(i for i in known if verdicts.get(i) == "ambigu")
-        if lost:
-            marks.append(f"facts learned otherwise: {', '.join(lost)}")
         if gone:
             print(f"  {point['point']:22s} no longer answers {len(gone)} of "
                   f"{len(known)}: {', '.join(gone)}")
         if unclear:
             print(f"  {point['point']:22s} unclear, read them: {', '.join(unclear)}")
-        # bpc measures cost: it going UP is the loss. Comparing the wrong way
-        # round would silently pass every degraded checkpoint.
-        for capability in SHOULD_HOLD:
-            was = base["mesures"][capability]["bits_par_caractere"]
-            now = point["mesures"][capability]["bits_par_caractere"]
-            if (now - was) / was > HOLD_TOLERANCE:
-                marks.append(f"{capability} +{100 * (now - was) / was:.1f} % "
-                             f"(over {100 * HOLD_TOLERANCE:.0f} %)")
+        marks = marks_for(base, earlier, point, known)
         print(f"  {point['point']:22s} {'; '.join(marks) if marks else 'none'}")
-        if marks and first_crossed is None:
-            first_crossed = point["point"]
 
-    # Checkpoints after the first signal are excluded even when one shows a
-    # better number: past the signal the number no longer measures the same
-    # thing.
-    # The collapse checks apply HERE TOO, not only in `keepable`. The two paths
-    # answer the same question, and when only one applied them `--compare`
-    # returned a checkpoint that `--arms` rejected as collapsed.
-    said = criterion_answers()
-    eligible = []
-    for point in points[1:]:
-        if first_crossed and order(point["point"]) >= order(first_crossed):
-            break
-        why = collapsed(point, said)
-        if why:
-            print(f"  {point['point']:22s} {why}, not keepable")
-            continue
-        if unchecked(point, said):
-            print(f"  {point['point']:22s} no answer to the current twelve "
-                  "questions, collapse checks not applied")
-        eligible.append(point)
-    if not eligible:
-        # On stderr, because it is the REASON for the non-zero exit. Printed on
-        # stdout it left a caller that checks the return code with a traceback
-        # about the launcher and an empty stderr.
-        print("\nNO eligible checkpoint: the first one already crosses a signal.",
-              file=sys.stderr)
-        return 1
-
-    best = min(eligible,
-               key=lambda p: p["mesures"]["moore_humain"]["bits_par_caractere"])
+    # Where each curve stops is `keepable`'s answer, the one `--arms` uses. This
+    # function once carried its own copy of the rule, and the copy drifted: it
+    # stopped on facts that were only not comparable, and cut every arm at the
+    # first signal of any arm.
+    said = criterion_answers() if answers is None else answers
     start = base["mesures"]["moore_humain"]["bits_par_caractere"]
-    end = best["mesures"]["moore_humain"]["bits_par_caractere"]
-    print(f"\nBEST: {best['point']}   Moore {start:.4f} -> {end:.4f} bpc  "
-          f"({100 * (end - start) / start:+.1f} %)")
-    if first_crossed:
-        print(f"  (from {first_crossed} onward excluded: signal crossed)")
-    return 0
+    failed = False
+    for arm, curve in curves.items():
+        best, crossed, skipped = keepable(base, curve, said)
+        for name, why in skipped:
+            print(f"  {arm}/{name.removeprefix('checkpoint-')}: {why}, not keepable")
+        if best is None:
+            # On stderr, because it is the REASON for the non-zero exit. Printed
+            # on stdout it left a caller that checks the return code with a
+            # traceback about the launcher and an empty stderr.
+            why = (f"{crossed} already crosses a signal" if crossed
+                   else "every point collapsed")
+            print(f"\n{arm}: NO eligible checkpoint, {why}.", file=sys.stderr)
+            failed = True
+            continue
+        if unchecked(best, said):
+            print(f"  {arm}/{best['point'].removeprefix('checkpoint-')}: no answer "
+                  "to the current twelve questions, collapse checks not applied")
+        end = best["mesures"]["moore_humain"]["bits_par_caractere"]
+        print(f"\nBEST {arm}: {best['point']}   Moore {start:.4f} -> {end:.4f} bpc  "
+              f"({100 * (end - start) / start:+.1f} %)")
+        if crossed:
+            print(f"  (from {crossed} onward excluded: signal crossed)")
+    return 1 if failed else 0
 
 
 def arms(pattern: str, against: str = "A") -> int:
