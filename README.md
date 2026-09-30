@@ -42,7 +42,12 @@ character on the held-out texts of seven capabilities, the fact probe, and the
 generative probes. It reads its items from `evaluation/`, where the gated
 dataset's files go. The point files in `evaluation/points*/` here keep the
 numbers and drop the answers to the fact items and probes; the full point files are in the gated
-dataset, and `--compare` and `--arms` need them.
+dataset, and `--compare` and `--arms` need them. Once your access is granted:
+
+```bash
+huggingface-cli download burkimbia/yaaba-4B-eval --repo-type dataset --local-dir evaluation
+uv run python scripts/measure/evaluate_checkpoint.py --arms
+```
 
 ## What does not rerun from public material
 

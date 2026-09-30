@@ -455,11 +455,12 @@ def criterion_answers(directory: Path = EVAL) -> dict[tuple[str, str], list[str]
     **Only answers to the CURRENT twelve questions count.** Eight of the twelve
     files on disk answer earlier question sets, and taking them at the glob
     makes the gate read a point's old answers and clear it. The test
-    is the question itself, not the file's date or name.
+    is the question itself, not the file's date or name. The twelve come from
+    `questions_tenues.jsonl` in the gated evaluation set.
     """
-    held = {" ".join(sorted(moore._WORD.findall(
-        next(m["content"] for m in turn["messages"] if m["role"] == "user").casefold())))
-        for turn in _held_turns()}
+    held = {" ".join(sorted(moore._WORD.findall(q["question"].casefold())))
+            for q in (json.loads(line) for line in
+                      (directory / "questions_tenues.jsonl").open(encoding="utf-8"))}
     by_point: dict[tuple[str, str], list[str]] = {}
     for path in sorted(directory.glob("reponses-*.jsonl")):
         for line in path.open(encoding="utf-8"):
@@ -471,13 +472,6 @@ def criterion_answers(directory: Path = EVAL) -> dict[tuple[str, str], list[str]
             key = answer_key(arm, answered["point"])
             by_point.setdefault(key, []).append(answered["obtenu"])
     return by_point
-
-
-def _held_turns() -> list[dict]:
-    sys.path.insert(0, str(ROOT / "scripts" / "train"))
-    import train_sft
-
-    return train_sft.questions_tenues()
 
 
 def collapsed(point: dict, answers: dict[tuple[str, str], list[str]]) -> str | None:
