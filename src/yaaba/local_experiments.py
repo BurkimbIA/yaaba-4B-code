@@ -237,6 +237,15 @@ def prepare_chat_dataset(
         if isinstance(source_record.get("record"), Mapping):
             record = dict(source_record["record"])
             lineage_envelopes += 1
+            lineage = source_record.get("lineage")
+            if isinstance(lineage, Mapping) and lineage.get("split") is not None:
+                if (record.get("split") is not None and
+                        str(record["split"]).casefold() !=
+                        str(lineage["split"]).casefold()):
+                    raise ValueError(
+                        f"{where}: record.split conflicts with lineage.split"
+                    )
+                record["split"] = lineage["split"]
         else:
             record = source_record
         if include_variants is not None or exclude_variants is not None:
@@ -302,6 +311,11 @@ def prepare_chat_dataset(
                         "origin_path": envelope["lineage"].get("origin_path"),
                         "origin_line": envelope["lineage"].get("origin_line"),
                         "record_hash": envelope["lineage"].get("record_hash"),
+                        **({"group_kind": envelope["lineage"]["group_kind"]}
+                           if "group_kind" in envelope["lineage"] else {}),
+                        **({"group_evidence_fields":
+                            envelope["lineage"]["group_evidence_fields"]}
+                           if "group_evidence_fields" in envelope["lineage"] else {}),
                     } if isinstance(envelope.get("lineage"), Mapping) else {}),
                 },
             })

@@ -44,6 +44,18 @@ TRAIN_LOSS = re.compile(
     r"It/sec\s+(?P<steps>[0-9.eE+-]+).*?Tokens/sec\s+(?P<tokens>[0-9.eE+-]+)"
 )
 VAL_LOSS = re.compile(r"Iter\s+(?P<step>\d+):\s+Val loss\s+(?P<loss>[0-9.eE+-]+)")
+ANSI = re.compile(r"\x1b\[[0-9;]*m")
+TABLE_TRAIN_LOSS = re.compile(
+    r"^\s*(?P<step>\d+)\s+(?P<loss>[0-9.eE+-]+)\s+[▼▲]\s+"
+    r"(?P<tokens>[0-9,.]+)\s+[0-9,.]+k\s*$"
+)
+TABLE_VAL_LOSS = re.compile(
+    r"^\s*(?P<step>\d+)\s+val\s+(?P<loss>[0-9.eE+-]+)\s+[0-9.]+s\s*$"
+)
+
+
+class TrainingRunFailed(RuntimeError):
+    """Signal a bounded stop after artifacts are written and tracked."""
 
 
 def _positive(value: str) -> int:
@@ -158,12 +170,19 @@ def _resolve_remote(model: str, revision: str | None) -> Path:
     return Path(snapshot_download(model, revision=revision)).resolve()
 
 
-def _metrics_from_log(log: Path, metrics: Path, offset: int = 0) -> None:
+def _metrics_from_log(log: Path, metrics: Path, offset: int = 0,
+                      grad_accumulation: int = 1) -> None:
     if not log.exists():
         return
-    for line in log.read_text(encoding="utf-8", errors="replace").splitlines():
+    for raw_line in log.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = ANSI.sub("", raw_line)
         if match := TRAIN_LOSS.search(line):
-            step = offset + int(match.group("step"))
+            iteration = int(match.group("step"))
+            if iteration % grad_accumulation:
+                raise ValueError(
+                    "MLX reported outside an optimizer-update boundary"
+                )
+            step = offset + iteration // grad_accumulation
             append_jsonl(metrics, {
                 "step": step, "kind": "ml", "name": "train_loss",
                 "value": float(match.group("loss")), "source": "mlx-lm stdout",
@@ -172,11 +191,36 @@ def _metrics_from_log(log: Path, metrics: Path, offset: int = 0) -> None:
                 "step": step, "kind": "technical", "name": "tokens_per_second",
                 "value": float(match.group("tokens")), "source": "mlx-lm stdout",
             })
+        elif match := TABLE_TRAIN_LOSS.search(line):
+            iteration = int(match.group("step"))
+            if iteration % grad_accumulation:
+                raise ValueError(
+                    "MLX reported outside an optimizer-update boundary"
+                )
+            step = offset + iteration // grad_accumulation
+            append_jsonl(metrics, {
+                "step": step, "kind": "ml", "name": "train_loss",
+                "value": float(match.group("loss")), "source": "mlx-lm stdout",
+            })
+            append_jsonl(metrics, {
+                "step": step, "kind": "technical", "name": "tokens_per_second",
+                "value": float(match.group("tokens").replace(",", "")),
+                "source": "mlx-lm stdout",
+            })
         if match := VAL_LOSS.search(line):
             append_jsonl(metrics, {
-                "step": offset + int(match.group("step")), "kind": "ml",
+                "step": offset + max(
+                    0, (int(match.group("step")) - 1) // grad_accumulation
+                ), "kind": "ml",
                 "name": "validation_loss", "value": float(match.group("loss")),
                 "source": "mlx-lm stdout",
+            })
+        elif match := TABLE_VAL_LOSS.search(line):
+            iteration = int(match.group("step"))
+            append_jsonl(metrics, {
+                "step": offset + max(0, (iteration - 1) // grad_accumulation),
+                "kind": "ml", "name": "validation_loss",
+                "value": float(match.group("loss")), "source": "mlx-lm stdout",
             })
 
 
@@ -219,7 +263,7 @@ def _monitor(pid: int, path: Path, stop: threading.Event, *,
 
 def _run_bounded(command: list[str], log: Path, resources: Path,
                  walltime_seconds: int, *, memory_limit_bytes: int,
-                 minimum_available_bytes: int) -> tuple[int, str, float]:
+    minimum_available_bytes: int) -> tuple[int, str, float]:
     started = time.monotonic()
     stop = threading.Event()
     monitor_state: dict[str, str] = {}
@@ -259,7 +303,7 @@ def _run_bounded(command: list[str], log: Path, resources: Path,
     return code, reason, time.monotonic() - started
 
 
-def _latest_segment_checkpoint(run: Path) -> tuple[Path | None, int]:
+def _latest_segment_checkpoint(run: Path, grad_accumulation: int) -> tuple[Path | None, int]:
     candidates: list[tuple[int, Path]] = []
     for segment in (run / "adapters").glob("segment-*"):
         try:
@@ -268,8 +312,10 @@ def _latest_segment_checkpoint(run: Path) -> tuple[Path | None, int]:
             continue
         for checkpoint in segment.glob("*_adapters.safetensors"):
             local = checkpoint.name.partition("_")[0]
-            if local.isdigit():
-                candidates.append((offset + int(local), checkpoint))
+            if local.isdigit() and int(local) % grad_accumulation == 0:
+                candidates.append((
+                    offset + int(local) // grad_accumulation, checkpoint
+                ))
         final = segment / "adapters.safetensors"
         state = segment / "segment_state.json"
         if final.exists() and state.exists():
@@ -283,8 +329,8 @@ def _latest_segment_checkpoint(run: Path) -> tuple[Path | None, int]:
 
 def _mlx_config(args: argparse.Namespace, model: Path, run: Path,
                 completed: int, resume_file: Path | None) -> tuple[dict, Path]:
-    remaining = args.max_steps - completed
-    if remaining <= 0:
+    remaining_updates = args.max_steps - completed
+    if remaining_updates <= 0:
         raise ValueError(f"run already reached max_steps={args.max_steps}")
     adapter = run / "adapters" / f"segment-{completed:07d}"
     config = {
@@ -292,18 +338,18 @@ def _mlx_config(args: argparse.Namespace, model: Path, run: Path,
         "train": True,
         "fine_tune_type": "lora",
         "data": str(run / "data"),
-        "seed": args.seed,
+        "seed": args.seed + completed,
         "num_layers": args.num_layers,
         "batch_size": args.batch_size,
-        "iters": remaining,
+        "iters": remaining_updates * args.grad_accumulation,
         "val_batches": 8,
         "learning_rate": args.learning_rate,
-        "steps_per_report": min(args.report_every, remaining),
-        "steps_per_eval": min(args.eval_every, remaining),
+        "steps_per_report": min(args.report_every, remaining_updates) * args.grad_accumulation,
+        "steps_per_eval": min(args.eval_every, remaining_updates) * args.grad_accumulation,
         "grad_accumulation_steps": args.grad_accumulation,
         "resume_adapter_file": str(resume_file) if resume_file else None,
         "adapter_path": str(adapter),
-        "save_every": min(args.save_every, remaining),
+        "save_every": min(args.save_every, remaining_updates) * args.grad_accumulation,
         "max_seq_length": args.max_seq_length,
         "grad_checkpoint": True,
         "clear_cache_threshold": 2 * 1024**3,
@@ -320,7 +366,7 @@ def _mlx_config(args: argparse.Namespace, model: Path, run: Path,
 
 
 def _train_mlx(args: argparse.Namespace, model: Path, run: Path) -> dict:
-    resume_file, completed = _latest_segment_checkpoint(run)
+    resume_file, completed = _latest_segment_checkpoint(run, args.grad_accumulation)
     if args.resume and resume_file is None:
         raise ValueError("no saved MLX adapter checkpoint to resume")
     if not args.resume:
@@ -343,8 +389,11 @@ def _train_mlx(args: argparse.Namespace, model: Path, run: Path) -> dict:
         memory_limit_bytes=args.memory_limit_gb * 1024**3,
         minimum_available_bytes=args.minimum_available_gb * 1024**3,
     )
-    _metrics_from_log(log, run / "metrics.jsonl", offset=completed)
-    latest, total = _latest_segment_checkpoint(run)
+    _metrics_from_log(
+        log, run / "metrics.jsonl", offset=completed,
+        grad_accumulation=args.grad_accumulation,
+    )
+    latest, total = _latest_segment_checkpoint(run, args.grad_accumulation)
     if code == 0 and (adapter / "adapters.safetensors").exists():
         total = args.max_steps
         latest = adapter / "adapters.safetensors"
@@ -356,7 +405,10 @@ def _train_mlx(args: argparse.Namespace, model: Path, run: Path) -> dict:
     return {
         "status": reason, "exit_code": code, "duration_seconds": duration,
         "completed_steps": total, "latest_adapter": str(latest) if latest else None,
-        "resume_semantics": "adapter weights restored; optimizer state resets per MLX-LM",
+        "resume_semantics": (
+            "adapter weights restored; optimizer, accumulated gradients and data-loader "
+            "cursor reset; segment seed is base seed plus completed optimizer updates"
+        ),
     }
 
 
@@ -412,6 +464,7 @@ def _train_mps(args: argparse.Namespace, model_path: Path, run: Path) -> dict:
     ))
 
     started = time.monotonic()
+    stop_state: dict[str, str] = {}
 
     class BoundAndLog(TrainerCallback):
         low_available_samples = 0
@@ -427,6 +480,7 @@ def _train_mps(args: argparse.Namespace, model_path: Path, run: Path) -> dict:
 
         def on_step_end(self, _args, _state, control, **_kwargs):
             if time.monotonic() - started >= args.walltime_minutes * 60:
+                stop_state["reason"] = "walltime_limit"
                 control.should_save = True
                 control.should_training_stop = True
             if psutil is not None:
@@ -445,6 +499,10 @@ def _train_mps(args: argparse.Namespace, model_path: Path, run: Path) -> dict:
                 )
                 if (rss > args.memory_limit_gb * 1024**3 or
                         self.low_available_samples >= 3):
+                    stop_state["reason"] = (
+                        "rss_memory_limit" if rss > args.memory_limit_gb * 1024**3
+                        else "system_memory_floor"
+                    )
                     control.should_save = True
                     control.should_training_stop = True
             return control
@@ -481,10 +539,15 @@ def _train_mps(args: argparse.Namespace, model_path: Path, run: Path) -> dict:
     result = trainer.train(resume_from_checkpoint=str(resume) if resume else None)
     trainer.save_state()
     duration = time.monotonic() - started
+    checkpoints = [p for p in output.glob("checkpoint-*") if p.is_dir()]
+    latest_checkpoint = max(
+        checkpoints, key=lambda p: int(p.name.rpartition("-")[2])
+    ) if checkpoints else None
     return {
-        "status": "completed" if result.global_step >= args.max_steps else "walltime_limit",
+        "status": ("completed" if result.global_step >= args.max_steps else
+                   stop_state.get("reason", "process_failed")),
         "completed_steps": result.global_step, "duration_seconds": duration,
-        "latest_adapter": str(output),
+        "latest_adapter": str(latest_checkpoint) if latest_checkpoint else None,
         "resume_semantics": "Trainer checkpoint restores model, optimizer, scheduler and step",
     }
 
@@ -547,7 +610,8 @@ def _log_tracking(tracked, run: Path, result: dict) -> None:
                 row["name"], row["value"], kind=row["kind"],
                 step=int(row.get("step", 0)),
             )
-    for name in ("manifest.json", "tracking_manifest.json", "result.json",
+    for name in ("manifest.json", "tracking_manifest.json", "tracking_state.json",
+                 "result.json",
                  "resources.jsonl", "command.json"):
         path = run / name
         if path.exists():
@@ -561,10 +625,46 @@ def _log_tracking(tracked, run: Path, result: dict) -> None:
         )
 
 
+def _couple_tracking_resume(args: argparse.Namespace, run: Path) -> None:
+    if args.mlflow_run_id and not args.track:
+        raise ValueError("--mlflow-run-id requires --track")
+    if args.mlflow_run_id and not args.resume:
+        raise ValueError("--mlflow-run-id is only valid with --resume")
+    state_path = run / "tracking_state.json"
+    state = json.loads(state_path.read_text()) if state_path.exists() else {}
+    stored = state.get("mlflow_run_id")
+    if not args.resume:
+        return
+    if stored and not args.track:
+        raise ValueError("this run is tracked; --resume must also use --track")
+    if args.track:
+        if args.mlflow_run_id and stored and args.mlflow_run_id != stored:
+            raise ValueError("--mlflow-run-id differs from the persisted run id")
+        args.mlflow_run_id = args.mlflow_run_id or stored
+        if not args.mlflow_run_id:
+            raise ValueError(
+                "tracked resume requires the persisted or explicit MLflow run id"
+            )
+
+
+def _raise_for_failed_result(result: dict) -> None:
+    failed = result.get("status") in {
+        "process_failed", "rss_memory_limit", "system_memory_floor"
+    }
+    limit_without_checkpoint = (
+        result.get("status") == "walltime_limit" and
+        not result.get("latest_adapter")
+    )
+    if failed or limit_without_checkpoint:
+        # This executes inside tracked_run so its __exit__ marks MLflow FAILED.
+        raise TrainingRunFailed(str(result.get("status")))
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     run = args.output.resolve()
     run.mkdir(parents=True, exist_ok=True)
+    _couple_tracking_resume(args, run)
 
     if args.mock_smoke:
         args.data, args.heldout, mock_model = _mock_files(run)
@@ -632,6 +732,10 @@ def main(argv: list[str] | None = None) -> int:
             raise SystemExit(
                 "no train example has an assistant token within --max-seq-length"
             )
+    code_identity = git_identity(ROOT)
+    versions = package_versions(
+        ("mlx", "mlx-lm", "torch", "transformers", "peft", "sacrebleu", "mlflow")
+    )
     training = {
         "backend": args.backend, "seed": args.seed,
         "max_steps": args.max_steps, "walltime_minutes": args.walltime_minutes,
@@ -648,15 +752,12 @@ def main(argv: list[str] | None = None) -> int:
     contract = {
         "model": identity, "chat_template": template_identity,
         "data": data_provenance, "training": training,
+        "code": code_identity, "versions": versions,
         "evidence_kind": "TECHNICAL_MOCK" if args.mock_smoke else "OBSERVED_LOCAL_RUN",
     }
     contract_hash = ensure_resume_contract(run / "resume_contract.json", contract, args.resume)
     manifest = {
         **contract, "contract_sha256": contract_hash,
-        "code": git_identity(ROOT),
-        "versions": package_versions(
-            ("mlx", "mlx-lm", "torch", "transformers", "peft", "sacrebleu")
-        ),
         "limits": {
             "samples": data_provenance["assistant_examples"],
             "steps": args.max_steps, "walltime_seconds": args.walltime_minutes * 60,
@@ -674,24 +775,33 @@ def main(argv: list[str] | None = None) -> int:
     }
     write_json(run / "manifest.json", manifest)
 
-    with _tracking_context(args, manifest, run) as tracked:
-        if args.mock_smoke:
-            result = {
-                "status": "mock_smoke_passed", "completed_steps": 0,
-                "backend": "explicit-mock-no-training",
-            }
-        elif args.backend == "mlx":
-            result = _train_mlx(args, Path(runtime_model), run)
-        else:
-            result = _train_mps(args, Path(runtime_model), run)
-        if tracked is not None:
-            result["mlflow_run_id"] = tracked.run_id
-        write_json(run / "result.json", result)
-        _log_tracking(tracked, run, result)
+    try:
+        with _tracking_context(args, manifest, run) as tracked:
+            if tracked is not None:
+                write_json(run / "tracking_state.json", {
+                    "mlflow_run_id": tracked.run_id,
+                    "tracking_uri": args.tracking_uri,
+                    "experiment_name": args.experiment_name,
+                })
+            if args.mock_smoke:
+                result = {
+                    "status": "mock_smoke_passed", "completed_steps": 0,
+                    "backend": "explicit-mock-no-training",
+                }
+            elif args.backend == "mlx":
+                result = _train_mlx(args, Path(runtime_model), run)
+            else:
+                result = _train_mps(args, Path(runtime_model), run)
+            if tracked is not None:
+                result["mlflow_run_id"] = tracked.run_id
+            write_json(run / "result.json", result)
+            _log_tracking(tracked, run, result)
+            _raise_for_failed_result(result)
+    except TrainingRunFailed:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 1
     print(json.dumps(result, ensure_ascii=False, indent=2))
-    return 1 if result.get("status") in {
-        "process_failed", "rss_memory_limit", "system_memory_floor"
-    } else 0
+    return 0
 
 
 if __name__ == "__main__":

@@ -234,12 +234,75 @@ def test_mlx_config_is_bounded_and_masks_prompt(tmp_path):
         "--max-steps", "9", "--save-every", "4",
     ])
     config, _ = train_mlx._mlx_config(args, tmp_path, tmp_path / "out", 4, None)
-    assert config["iters"] == 5
+    # Public max_steps is optimizer updates; MLX iters is micro-batches.
+    assert config["iters"] == 5 * args.grad_accumulation
     assert config["mask_prompt"] is True
-    assert config["save_every"] == 4
+    assert config["save_every"] == 4 * args.grad_accumulation
     assert config["grad_checkpoint"] is True
-    assert config["steps_per_report"] == 5
+    assert config["steps_per_report"] == 5 * args.grad_accumulation
     assert config["clear_cache_threshold"] == 2 * 1024**3
+
+
+def test_mlx_checkpoint_counts_only_complete_optimizer_updates(tmp_path):
+    segment = tmp_path / "adapters" / "segment-0000002"
+    segment.mkdir(parents=True)
+    (segment / "0000007_adapters.safetensors").touch()
+    assert train_mlx._latest_segment_checkpoint(tmp_path, 8) == (None, 0)
+    complete = segment / "0000008_adapters.safetensors"
+    complete.touch()
+    assert train_mlx._latest_segment_checkpoint(tmp_path, 8) == (complete, 3)
+
+
+def test_mlx_032_table_metrics_are_parsed_as_optimizer_steps(tmp_path):
+    log = tmp_path / "mlx.log"
+    log.write_text(
+        "\x1b[1m   8    \x1b[32m4.151 ▼\x1b[0m       3      0.0k\n"
+        "  16    3.070 ▼       40      0.1k\n",
+        encoding="utf-8",
+    )
+    metrics = tmp_path / "metrics.jsonl"
+    train_mlx._metrics_from_log(log, metrics, offset=2, grad_accumulation=8)
+    rows = [json.loads(line) for line in metrics.read_text().splitlines()]
+    losses = [row for row in rows if row["name"] == "train_loss"]
+    assert [(row["step"], row["value"]) for row in losses] == [
+        (3, 4.151), (4, 3.070),
+    ]
+
+
+def test_tracked_resume_is_coupled_to_persisted_run_id(tmp_path):
+    args = train_mlx.parser().parse_args([
+        "--model", str(tmp_path), "--data", str(tmp_path / "data"),
+        "--output", str(tmp_path), "--heldout", str(tmp_path / "held"),
+        "--resume", "--track",
+    ])
+    (tmp_path / "tracking_state.json").write_text(
+        json.dumps({"mlflow_run_id": "persisted-id"}), encoding="utf-8"
+    )
+    train_mlx._couple_tracking_resume(args, tmp_path)
+    assert args.mlflow_run_id == "persisted-id"
+    args.mlflow_run_id = "different-id"
+    with pytest.raises(ValueError, match="differs"):
+        train_mlx._couple_tracking_resume(args, tmp_path)
+
+
+@pytest.mark.parametrize("status", [
+    "process_failed", "rss_memory_limit", "system_memory_floor",
+])
+def test_failed_result_raises_inside_tracking_context(status):
+    with pytest.raises(train_mlx.TrainingRunFailed, match=status):
+        train_mlx._raise_for_failed_result({
+            "status": status, "latest_adapter": "checkpoint",
+        })
+
+
+def test_walltime_without_checkpoint_fails_but_saved_stop_is_valid():
+    with pytest.raises(train_mlx.TrainingRunFailed, match="walltime_limit"):
+        train_mlx._raise_for_failed_result({
+            "status": "walltime_limit", "latest_adapter": None,
+        })
+    train_mlx._raise_for_failed_result({
+        "status": "walltime_limit", "latest_adapter": "checkpoint",
+    })
 
 
 def test_explicit_mock_smokes_write_honest_artifacts(tmp_path):
@@ -251,6 +314,11 @@ def test_explicit_mock_smokes_write_honest_artifacts(tmp_path):
     train_manifest = json.loads((training / "manifest.json").read_text())
     assert train_manifest["evidence_kind"] == "TECHNICAL_MOCK"
     assert "no model quality evidence" in train_manifest["claim_scope"]
+    resume_contract = json.loads(
+        (training / "resume_contract.json").read_text()
+    )["contract"]
+    assert resume_contract["code"] == train_manifest["code"]
+    assert resume_contract["versions"] == train_manifest["versions"]
 
     questions = _jsonl(tmp_path / "questions.jsonl", [{
         "id": "q1", "prompt": "What is this?", "reference": "A test."

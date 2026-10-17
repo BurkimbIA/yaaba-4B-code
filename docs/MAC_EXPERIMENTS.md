@@ -59,8 +59,19 @@ et à l'[API de génération officielle](https://github.com/ml-explore/mlx-lm#py
 
 MLX-LM sauvegarde les adaptateurs périodiques et les recharge avec
 `resume_adapter_file`. Cette reprise restaure les poids LoRA, mais pas l'état de
-l'optimiseur ; chaque segment le signale dans `result.json`. Le backend MPS
-utilise les checkpoints Trainer et restaure poids, optimiseur, scheduler et pas.
+l'optimiseur, les gradients accumulés ni le curseur du chargeur ; le segment
+suivant repart avec la seed de base augmentée du nombre de mises à jour déjà
+terminées. Ce mécanisme est une nouvelle séquence déterministe depuis les poids
+sauvegardés, pas une continuation bit-à-bit. Le backend MPS utilise les
+checkpoints Trainer et restaure poids, optimiseur, scheduler et pas.
+
+`--max-steps`, `--save-every`, `--eval-every` et `--report-every` sont toujours
+exprimés en mises à jour de l'optimiseur. Pour MLX, le runner les multiplie par
+`--grad-accumulation` avant de produire les micro-pas et refuse un checkpoint
+hors frontière de mise à jour. Le contrat de reprise inclut le commit, l'état
+Git et les versions du runtime. Une reprise trackée recharge obligatoirement le
+Run ID MLflow persisté ; un échec ou une limite sans checkpoint lève une erreur
+dans le contexte de suivi et marque le run `FAILED`.
 
 Le corpus `moore_assistant_sft.jsonl` ne fournit pas actuellement un identifiant
 de document ou de groupe dont l'indépendance soit prouvée ; son champ `source`
@@ -173,5 +184,18 @@ duré 11,08 s. Le SHA-256 du poids est
 `55da672dc001dcc6a1515e699818dab94151a4d9d3d62bde6173a4b7ea62d342`.
 
 Cela prouve le chargement et la génération texte locale pour cette révision.
-Cela ne prouve pas encore que la rétropropagation Qwen3.5 tient dans le budget
-mémoire, ni que les réponses en mooré sont correctes.
+
+Un pilote LoRA technique de trois mises à jour a ensuite utilisé 15 exemples du
+pilote lineage à 256 tokens, une couche et un rank 4. Les pertes assistant-only
+observées ont été 4,151, 3,070 et 3,311. Chaque checkpoint diffère du précédent
+(239 615 puis 239 616 éléments modifiés ; normes L2 0,01528 et 0,01602), ce qui
+confirme une rétropropagation et des mises à jour de poids. L'entraînement a duré
+13,66 s ; le processus complet a culminé à 3,15 Go de RSS et le moniteur n'a pas
+observé moins de 7,66 Go disponibles. Le run MLflow est
+`584e8671382040eb8ca61c38ffa67b87`. Les métriques loss/tokens ont été reparsées
+et journalisées après le run, car la table Rich de MLX-LM 0.32.2 différait du
+format historique ; le correctif est couvert par un test de régression.
+
+Ce pilote prouve que le chargement, le masque, la rétropropagation, les
+checkpoints et le suivi tiennent dans ce budget précis. Il ne mesure pas la
+qualité des réponses en mooré et ne remplace aucune évaluation humaine.
