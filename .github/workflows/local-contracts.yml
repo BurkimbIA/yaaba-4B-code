@@ -1,0 +1,25 @@
+name: Local experiment contracts
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+concurrency:
+  group: contracts-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  contracts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install contract test dependencies
+        run: python -m pip install pytest ruff==0.17.1 sacrebleu -r requirements-tracking.txt
+      - name: Lint
+        run: python -m ruff check .
+      - name: Test CPU contracts without model downloads
+        run: python -m pytest tests -q
