@@ -368,6 +368,9 @@ def main(argv: list[str] | None = None) -> int:
         "thinking_requested": False, "draft_model": None,
     }
     code_identity = git_identity(ROOT)
+    versions = package_versions(
+        ("mlx", "mlx-lm", "torch", "transformers", "peft", "sacrebleu")
+    )
     system_contract = {
         "model_identity_sha256": identity.get(
             "identity_sha256", canonical_hash({
@@ -375,16 +378,28 @@ def main(argv: list[str] | None = None) -> int:
             })
         ),
         "adapter_identity_sha256": (
-            adapter_identity.get("identity_sha256", canonical_hash(adapter_identity))
+            adapter_identity.get("identity_sha256")
+            or adapter_identity.get("sha256")
+            or canonical_hash(adapter_identity)
             if adapter_identity else None
         ),
         "chat_template_sha256": template_identity["sha256"],
         "decoding": decoding,
         "evaluator_code": code_identity,
+        "component_sha256": {
+            "evaluate_local.py": sha256_file(Path(__file__)),
+            "evaluation_protocol.py": sha256_file(
+                ROOT / "src" / "yaaba" / "evaluation_protocol.py"
+            ),
+            "local_experiments.py": sha256_file(
+                ROOT / "src" / "yaaba" / "local_experiments.py"
+            ),
+        },
         "metrics": {
             "normalized_exact_match": "yaaba.local_experiments.normalized_text",
             "chrf": "sacrebleu.corpus_chrf defaults",
         },
+        "metric_versions": {"sacrebleu": versions["sacrebleu"]},
     }
     system_contract_sha256 = canonical_hash(system_contract)
     questions_sha256 = sha256_file(args.questions)
@@ -409,7 +424,7 @@ def main(argv: list[str] | None = None) -> int:
         "decoding": decoding, "max_samples": args.max_samples,
         "walltime_seconds": args.walltime_minutes * 60,
         "code": code_identity,
-        "versions": package_versions(("mlx", "mlx-lm", "torch", "transformers", "peft")),
+        "versions": versions,
         "claim_scope": "automatic metrics and raw generations; no human Mooré score",
         "system_contract": system_contract,
         "system_contract_sha256": system_contract_sha256,

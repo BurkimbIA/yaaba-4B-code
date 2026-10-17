@@ -216,6 +216,12 @@ def test_evaluator_legacy_run_records_non_independent_diagnostic(tmp_path):
     receipt = manifest["evaluation_protocol"]
     assert receipt["purpose"] == "diagnostic"
     assert receipt["independent_test_claim"] is False
+    assert manifest["system_contract"]["metric_versions"]["sacrebleu"]
+    assert set(manifest["system_contract"]["component_sha256"]) == {
+        "evaluate_local.py",
+        "evaluation_protocol.py",
+        "local_experiments.py",
+    }
     assert manifest["system_contract_sha256"] == canonical_hash(
         manifest["system_contract"]
     )
