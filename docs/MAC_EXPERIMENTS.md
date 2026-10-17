@@ -206,3 +206,41 @@ format historique ; le correctif est couvert par un test de régression.
 Ce pilote prouve que le chargement, le masque, la rétropropagation, les
 checkpoints et le suivi tiennent dans ce budget précis. Il ne mesure pas la
 qualité des réponses en mooré et ne remplace aucune évaluation humaine.
+
+## Pilote préenregistré de 64 mises à jour
+
+Le protocole `operations/2026-10-17-autonomous/PROTOCOLE-PILOTE.md` a été
+exécuté sur les 28 prompts fixes, puis 64 mises à jour LoRA, puis les mêmes 28
+prompts avec l'adaptateur. Les identités modèle, template, questions, ordre,
+seed et décodage sont égales entre les deux évaluations ; seul l'adaptateur
+diffère.
+
+Le train a utilisé 440 exemples effectifs : 512 lignes source, 472 après les
+exclusions directionnelles déclarées, puis 32 exemples rejetés parce que la
+réponse ne tenait pas entièrement dans 256 tokens. Les 64 pertes et les quatre
+checkpoints 16/32/48/64 sont enregistrés dans le run MLflow
+`c1a55b8f21794c7393a5e5b58cfd4977`. Le train a duré 19,07 s ; le moniteur a
+observé au plus 3,842 Go de RSS et au moins 8,355 Go disponibles. La moyenne des
+huit premières pertes est 4,5028, celle des huit dernières 3,1724. Ce sont des
+métriques d'optimisation bruitées, sans validation indépendante.
+
+| Mesure automatique | Base | Adapté |
+|---|---:|---:|
+| Prompts terminés | 28 | 28 |
+| Exact match normalisé, 24 références | 0 | 0 |
+| chrF, 24 références | 3,6791 | 4,2802 |
+| Tokens générés moyens | 64,9 | 52,7 |
+| Générations au plafond de 128 | 7 | 3 |
+| Latence moyenne | 1,360 s | 1,142 s |
+
+Runs MLflow : baseline `c4df8b94059d4970b1264edc12e8feb8`, adapté
+`15f30c1cf8304c82ac488d47af4e4e07`, analyse appariée posthoc
+`66c2c45f6bef4912857fd2ca71591410`. Les SHA-256 des sorties sont respectivement
+`07cca35a36430a57592f8886f2aa7e71fb19bb842f0e38ac5098f635cc3e345a` et
+`dc4a1d71ee0007638bf6bf7f9890e5611faf5c951a45dad2b6f109a7fa95eae6`.
+
+Le changement de chrF ne doit pas être interprété comme un gain de compétence.
+Les prompts demandent une forme lexicale courte, alors que plusieurs sorties
+sont des phrases explicatives : exact match et chrF mélangent accès lexical et
+format de réponse. Un diagnostic posthoc de containment reste à zéro dans les
+deux bras et les deux strates. Aucun score humain n'a été produit.
