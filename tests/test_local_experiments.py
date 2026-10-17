@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 from yaaba.local_experiments import (
@@ -263,6 +264,270 @@ def test_mlx_load_dataset_uses_exact_mask_and_source_order_before_seed(
         observed = [int(batch[0][0, 1].item()) - 65 for batch in batches]
         expected_order = np.random.RandomState(7).permutation(5).tolist()
         assert observed == expected_order
+
+
+def test_assistant_target_mask_excludes_only_fill_position_for_variable_lengths():
+    steps = np.arange(1, 9)
+    lengths = np.array([[3, 6], [2, 7]])
+    mask = mlx_lora_bounded._assistant_target_mask(steps, lengths, np)
+
+    assert np.flatnonzero(mask[0]).tolist() == [2, 3, 4]
+    assert np.flatnonzero(mask[1]).tolist() == [1, 2, 3, 4, 5]
+
+
+def test_mlx_real_batch_loss_contract_keeps_internal_zero_and_eos(tmp_path, monkeypatch):
+    mx = pytest.importorskip("mlx.core")
+    from mlx_lm.tuner.datasets import CacheDataset, ChatDataset, load_dataset
+    from mlx_lm.tuner.trainer import iterate_batches
+
+    class TerminatedTokenizer:
+        def apply_chat_template(
+            self,
+            messages,
+            *,
+            tokenize=True,
+            add_generation_prompt=False,
+            enable_thinking=False,
+            return_dict=False,
+            tools=None,
+        ):
+            assert tokenize and enable_thinking is False and return_dict is False
+            assert tools is None
+            tokens = [10, 11]
+            if add_generation_prompt:
+                return tokens + [20]
+            content = [0, 21] if messages[-1]["content"] == "long" else [21]
+            return tokens + [20] + content + [99, 198]
+
+    rows = [
+        {
+            "messages": [
+                {"role": "user", "content": "u"},
+                {"role": "assistant", "content": answer},
+            ]
+        }
+        for answer in ("short", "long")
+    ]
+    _jsonl(tmp_path / "train.jsonl", rows)
+    config = SimpleNamespace(
+        data=str(tmp_path),
+        train=True,
+        test=False,
+        mask_prompt=True,
+        hf_dataset=False,
+    )
+    with monkeypatch.context() as patch:
+        patch.setattr(ChatDataset, "process", ChatDataset.process)
+        mlx_lora_bounded._install_exact_chat_mask()
+        train, _, _ = load_dataset(config, TerminatedTokenizer())
+        batch, lengths = next(
+            iterate_batches(
+                CacheDataset(train),
+                batch_size=2,
+                max_seq_length=32,
+                loop=False,
+                seed=7,
+            )
+        )
+
+    batch_np = np.array(batch)
+    lengths_np = np.array(lengths)
+    targets = batch_np[:, 1:]
+    steps = np.arange(1, targets.shape[1] + 1)
+    mask = mlx_lora_bounded._assistant_target_mask(steps, lengths_np, np)
+    selected = [targets[index][mask[index]].tolist() for index in range(2)]
+
+    assert sorted(selected, key=len) == [[21, 99, 198], [0, 21, 99, 198]]
+    for index, (offset, length) in enumerate(lengths_np):
+        assert selected[index] == batch_np[index, offset:length].tolist()
+        assert batch_np[index, length] == 0
+        assert len(selected[index]) == length - offset
+
+    class ZeroLogitModel:
+        def __call__(self, inputs):
+            return mx.zeros((*inputs.shape, 256))
+
+    loss, token_count = mlx_lora_bounded._assistant_loss_without_batch_fill(
+        ZeroLogitModel(), batch, lengths
+    )
+    mx.eval(loss, token_count)
+    assert int(token_count.item()) == sum(len(tokens) for tokens in selected)
+    assert np.isfinite(float(loss.item()))
+
+
+def test_scoped_assistant_loss_injects_and_restores_on_success_and_failure():
+    calls = {"train": [], "evaluate": []}
+    state = {"fail": False}
+
+    def original_train(
+        model,
+        optimizer,
+        train_dataset,
+        val_dataset=None,
+        args=None,
+        loss=None,
+    ):
+        calls["train"].append(loss)
+        if state["fail"]:
+            raise RuntimeError("training failed")
+        return "trained"
+
+    def original_evaluate(
+        model,
+        dataset,
+        batch_size,
+        num_batches,
+        max_seq_length=2048,
+        loss=None,
+    ):
+        calls["evaluate"].append(loss)
+        return 1.0
+
+    lora_module = SimpleNamespace(
+        train=original_train, evaluate=original_evaluate
+    )
+    dataset = [([10, 20, 99], 1)]
+    training_args = SimpleNamespace(max_seq_length=8)
+    with mlx_lora_bounded._scoped_assistant_loss(lora_module):
+        assert lora_module.train(
+            None, None, dataset, dataset, args=training_args
+        ) == "trained"
+        assert lora_module.evaluate(None, dataset, 1, 1, max_seq_length=8) == 1.0
+        assert calls == {
+            "train": [mlx_lora_bounded._assistant_loss_without_batch_fill],
+            "evaluate": [mlx_lora_bounded._assistant_loss_without_batch_fill],
+        }
+    assert lora_module.train is original_train
+    assert lora_module.evaluate is original_evaluate
+
+    state["fail"] = True
+    with pytest.raises(RuntimeError, match="training failed"):
+        with mlx_lora_bounded._scoped_assistant_loss(lora_module):
+            lora_module.train(None, None, dataset, dataset, args=training_args)
+    assert lora_module.train is original_train
+    assert lora_module.evaluate is original_evaluate
+
+
+def test_scoped_assistant_loss_refuses_an_explicit_different_loss():
+    def original_train(
+        model,
+        optimizer,
+        train_dataset,
+        val_dataset=None,
+        args=None,
+        loss=None,
+    ):
+        return loss
+
+    def original_evaluate(
+        model,
+        dataset,
+        batch_size,
+        num_batches,
+        max_seq_length=2048,
+        loss=None,
+    ):
+        return loss
+
+    lora_module = SimpleNamespace(
+        train=original_train, evaluate=original_evaluate
+    )
+    dataset = [([10, 20, 99], 1)]
+    with mlx_lora_bounded._scoped_assistant_loss(lora_module):
+        with pytest.raises(ValueError, match="explicitly supplied"):
+            lora_module.train(
+                None,
+                None,
+                dataset,
+                args=SimpleNamespace(max_seq_length=8),
+                loss=lambda: None,
+            )
+        with pytest.raises(ValueError, match="explicitly supplied"):
+            lora_module.evaluate(
+                None, dataset, 1, 1, max_seq_length=8, loss=lambda: None
+            )
+
+
+@pytest.mark.parametrize(
+    "mode", ["omitted", "keyword_none", "positional_none", "custom_identical"]
+)
+def test_scoped_assistant_loss_normalizes_supported_call_forms(mode):
+    def original_train(
+        model,
+        optimizer,
+        train_dataset,
+        val_dataset=None,
+        args=None,
+        loss=None,
+    ):
+        return loss
+
+    def original_evaluate(
+        model,
+        dataset,
+        batch_size,
+        num_batches,
+        max_seq_length=2048,
+        loss=None,
+    ):
+        return loss
+
+    lora_module = SimpleNamespace(
+        train=original_train, evaluate=original_evaluate
+    )
+    dataset = [([10, 20, 99], 1)]
+    training_args = SimpleNamespace(max_seq_length=8)
+    custom = mlx_lora_bounded._assistant_loss_without_batch_fill
+    with mlx_lora_bounded._scoped_assistant_loss(lora_module):
+        if mode == "omitted":
+            train_loss = lora_module.train(
+                None, None, dataset, dataset, args=training_args
+            )
+            test_loss = lora_module.evaluate(
+                None, dataset, 1, 1, max_seq_length=8
+            )
+        elif mode == "keyword_none":
+            train_loss = lora_module.train(
+                None, None, dataset, dataset, args=training_args, loss=None
+            )
+            test_loss = lora_module.evaluate(
+                None, dataset, 1, 1, max_seq_length=8, loss=None
+            )
+        elif mode == "positional_none":
+            train_loss = lora_module.train(
+                None, None, dataset, dataset, training_args, None
+            )
+            test_loss = lora_module.evaluate(None, dataset, 1, 1, 8, None)
+        else:
+            train_loss = lora_module.train(
+                None, None, dataset, dataset, training_args, custom
+            )
+            test_loss = lora_module.evaluate(None, dataset, 1, 1, 8, custom)
+    assert train_loss is custom
+    assert test_loss is custom
+
+
+@pytest.mark.parametrize(
+    ("tokens", "offset", "max_seq_length"),
+    [
+        ([10, 20], 2, 8),
+        ([10, 20, 30, 40], 3, 3),
+        ([10], 0, 8),
+    ],
+)
+def test_loss_dataset_validation_rejects_rows_without_real_target(
+    tokens, offset, max_seq_length
+):
+    with pytest.raises(ValueError, match="no real loss target"):
+        mlx_lora_bounded._validate_loss_dataset(
+            [(tokens, offset)], max_seq_length, "train"
+        )
+
+
+def test_loss_dataset_validation_accepts_internal_zero_target():
+    mlx_lora_bounded._validate_loss_dataset(
+        [([10, 0, 99, 198], 1)], 8, "train"
+    )
 
 
 def test_preflight_drops_overflow_and_keeps_supervised_assistant_token(tmp_path):
