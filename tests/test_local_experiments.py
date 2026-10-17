@@ -356,31 +356,119 @@ def test_mlx_real_batch_loss_contract_keeps_internal_zero_and_eos(tmp_path, monk
 
 
 def test_scoped_assistant_loss_injects_and_restores_on_success_and_failure():
-    calls = []
+    calls = {"train": [], "evaluate": []}
+    state = {"fail": False}
 
-    def original_train(*args, **kwargs):
-        calls.append(kwargs["loss"])
-        if kwargs.get("fail"):
+    def original_train(
+        model,
+        optimizer,
+        train_dataset,
+        val_dataset=None,
+        args=None,
+        loss=None,
+    ):
+        calls["train"].append(loss)
+        if state["fail"]:
             raise RuntimeError("training failed")
         return "trained"
 
-    lora_module = SimpleNamespace(train=original_train)
-    with mlx_lora_bounded._scoped_assistant_loss(lora_module):
-        assert lora_module.train() == "trained"
-        assert calls == [mlx_lora_bounded._assistant_loss_without_batch_fill]
-    assert lora_module.train is original_train
+    def original_evaluate(
+        model,
+        dataset,
+        batch_size,
+        num_batches,
+        max_seq_length=2048,
+        loss=None,
+    ):
+        calls["evaluate"].append(loss)
+        return 1.0
 
+    lora_module = SimpleNamespace(
+        train=original_train, evaluate=original_evaluate
+    )
+    dataset = [([10, 20, 99], 1)]
+    training_args = SimpleNamespace(max_seq_length=8)
+    with mlx_lora_bounded._scoped_assistant_loss(lora_module):
+        assert lora_module.train(
+            None, None, dataset, dataset, args=training_args
+        ) == "trained"
+        assert lora_module.evaluate(None, dataset, 1, 1, max_seq_length=8) == 1.0
+        assert calls == {
+            "train": [mlx_lora_bounded._assistant_loss_without_batch_fill],
+            "evaluate": [mlx_lora_bounded._assistant_loss_without_batch_fill],
+        }
+    assert lora_module.train is original_train
+    assert lora_module.evaluate is original_evaluate
+
+    state["fail"] = True
     with pytest.raises(RuntimeError, match="training failed"):
         with mlx_lora_bounded._scoped_assistant_loss(lora_module):
-            lora_module.train(fail=True)
+            lora_module.train(None, None, dataset, dataset, args=training_args)
     assert lora_module.train is original_train
+    assert lora_module.evaluate is original_evaluate
 
 
 def test_scoped_assistant_loss_refuses_an_explicit_different_loss():
-    lora_module = SimpleNamespace(train=lambda **kwargs: kwargs)
+    def original_train(
+        model,
+        optimizer,
+        train_dataset,
+        val_dataset=None,
+        args=None,
+        loss=None,
+    ):
+        return loss
+
+    def original_evaluate(
+        model,
+        dataset,
+        batch_size,
+        num_batches,
+        max_seq_length=2048,
+        loss=None,
+    ):
+        return loss
+
+    lora_module = SimpleNamespace(
+        train=original_train, evaluate=original_evaluate
+    )
+    dataset = [([10, 20, 99], 1)]
     with mlx_lora_bounded._scoped_assistant_loss(lora_module):
         with pytest.raises(ValueError, match="explicitly supplied"):
-            lora_module.train(loss=lambda: None)
+            lora_module.train(
+                None,
+                None,
+                dataset,
+                args=SimpleNamespace(max_seq_length=8),
+                loss=lambda: None,
+            )
+        with pytest.raises(ValueError, match="explicitly supplied"):
+            lora_module.evaluate(
+                None, dataset, 1, 1, max_seq_length=8, loss=lambda: None
+            )
+
+
+@pytest.mark.parametrize(
+    ("tokens", "offset", "max_seq_length"),
+    [
+        ([10, 20], 2, 8),
+        ([10, 20, 30, 40], 3, 3),
+        ([10], 0, 8),
+    ],
+)
+def test_loss_dataset_validation_rejects_rows_without_real_target(
+    tokens, offset, max_seq_length
+):
+    with pytest.raises(ValueError, match="no real loss target"):
+        mlx_lora_bounded._validate_loss_dataset(
+            [(tokens, offset)], max_seq_length, "train"
+        )
+
+
+def test_loss_dataset_validation_accepts_internal_zero_target():
+    mlx_lora_bounded._validate_loss_dataset(
+        [([10, 0, 99, 198], 1)], 8, "train"
+    )
 
 
 def test_preflight_drops_overflow_and_keeps_supervised_assistant_token(tmp_path):

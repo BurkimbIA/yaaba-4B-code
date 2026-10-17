@@ -264,8 +264,10 @@ une loss utilisant `steps < length`. Le masque conserve tous les tokens réels
 de la réponse, dont `<|im_end|>` et la nouvelle ligne qui le suit, et exclut la
 première position de remplissage. Un ID `0` qui apparaît réellement à
 l'intérieur d'une réponse reste supervisé. La même fonction est transmise par
-MLX à l'entraînement et à la validation. Le hook est retiré dans un bloc
-`finally`, y compris après une exception.
+MLX à l'entraînement, à la validation et à l'évaluation de test. Avant la
+compilation, le wrapper refuse toute ligne dont la troncature ne laisserait
+aucune cible réelle. Le hook est retiré dans un bloc `finally`, y compris après
+une exception.
 
 Cette correction s'applique seulement aux nouveaux runs exécutés avec ce
 wrapper. Les métriques historiques conservent le contrat MLX d'alors et ne sont

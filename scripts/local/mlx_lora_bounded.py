@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import inspect
 import sys
 from contextlib import contextmanager
 from functools import wraps
@@ -77,24 +78,83 @@ def _assistant_loss_without_batch_fill(model, batch, lengths):
     return ce, ntoks
 
 
+def _validate_loss_dataset(dataset, max_seq_length: int, name: str) -> None:
+    """Fail before compilation when a dataset row has no real target token."""
+    if dataset is None:
+        return
+    if max_seq_length < 2:
+        raise ValueError("max_seq_length must leave room for a causal target")
+    for index in range(len(dataset)):
+        item = dataset[index]
+        if not isinstance(item, tuple) or len(item) != 2:
+            raise ValueError(f"{name} row {index}: expected (tokens, offset)")
+        tokens, offset = item
+        if not isinstance(offset, int) or offset < 0:
+            raise ValueError(f"{name} row {index}: invalid target offset {offset!r}")
+        effective_length = min(len(tokens), max_seq_length)
+        first_target_step = max(offset, 1)
+        if first_target_step >= effective_length:
+            raise ValueError(
+                f"{name} row {index}: no real loss target remains after "
+                f"truncation (offset={offset}, effective_length={effective_length})"
+            )
+
+
 @contextmanager
 def _scoped_assistant_loss(lora_module):
-    """Inject the corrected loss into MLX LoRA and always restore its API."""
+    """Inject corrected train/evaluation loss and always restore the MLX API."""
     original_train = lora_module.train
+    original_evaluate = lora_module.evaluate
+    train_signature = inspect.signature(original_train)
+    evaluate_signature = inspect.signature(original_evaluate)
+    if not {"args", "train_dataset", "val_dataset", "loss"}.issubset(
+        train_signature.parameters
+    ):
+        raise RuntimeError("unsupported mlx_lm train API for exact loss injection")
+    if not {"dataset", "max_seq_length", "loss"}.issubset(
+        evaluate_signature.parameters
+    ):
+        raise RuntimeError("unsupported mlx_lm evaluate API for exact loss injection")
 
     @wraps(original_train)
     def train_with_assistant_loss(*args, **kwargs):
-        supplied = kwargs.get("loss")
+        bound = train_signature.bind_partial(*args, **kwargs)
+        supplied = bound.arguments.get("loss")
+        bound.apply_defaults()
         if supplied is not None and supplied is not _assistant_loss_without_batch_fill:
             raise ValueError("refusing to replace an explicitly supplied MLX loss")
-        kwargs["loss"] = _assistant_loss_without_batch_fill
+        training_args = bound.arguments["args"]
+        _validate_loss_dataset(
+            bound.arguments["train_dataset"], training_args.max_seq_length, "train"
+        )
+        _validate_loss_dataset(
+            bound.arguments["val_dataset"], training_args.max_seq_length, "validation"
+        )
+        if supplied is None:
+            kwargs["loss"] = _assistant_loss_without_batch_fill
         return original_train(*args, **kwargs)
 
+    @wraps(original_evaluate)
+    def evaluate_with_assistant_loss(*args, **kwargs):
+        bound = evaluate_signature.bind_partial(*args, **kwargs)
+        supplied = bound.arguments.get("loss")
+        bound.apply_defaults()
+        if supplied is not None and supplied is not _assistant_loss_without_batch_fill:
+            raise ValueError("refusing to replace an explicitly supplied MLX loss")
+        _validate_loss_dataset(
+            bound.arguments["dataset"], bound.arguments["max_seq_length"], "test"
+        )
+        if supplied is None:
+            kwargs["loss"] = _assistant_loss_without_batch_fill
+        return original_evaluate(*args, **kwargs)
+
     lora_module.train = train_with_assistant_loss
+    lora_module.evaluate = evaluate_with_assistant_loss
     try:
         yield
     finally:
         lora_module.train = original_train
+        lora_module.evaluate = original_evaluate
 
 
 def main() -> None:
