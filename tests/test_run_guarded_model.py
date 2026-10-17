@@ -151,17 +151,17 @@ def test_guard_checks_available_memory_before_spawn(tmp_path, monkeypatch):
 
 
 def test_guard_kills_child_that_ignores_term_on_health_exception(tmp_path, monkeypatch):
+    child_pid = tmp_path / "child.pid"
     calls = 0
 
     def health(_url):
         nonlocal calls
         calls += 1
-        if calls >= 3:
+        if child_pid.exists():
             raise RuntimeError("health changed")
         return HEALTHY
 
     monkeypatch.setattr(run_guarded_model, "_health", health)
-    child_pid = tmp_path / "child.pid"
     child = (
         "import os,signal,time,pathlib;"
         "signal.signal(signal.SIGTERM, signal.SIG_IGN);"
@@ -175,6 +175,7 @@ def test_guard_kills_child_that_ignores_term_on_health_exception(tmp_path, monke
         )
     )
     assert result == 70
+    assert calls >= 2
     pid = int(child_pid.read_text())
     for _ in range(20):
         try:
@@ -229,6 +230,24 @@ def test_group_existence_treats_transient_eperm_as_indeterminate(monkeypatch):
     monkeypatch.setattr(run_guarded_model.os, "killpg", killpg)
     assert run_guarded_model._wait_group_gone(12345, 0.1) is True
     assert outcomes == []
+
+
+def test_wait_group_gone_reaps_direct_leader_before_rechecking(monkeypatch):
+    class ExitedLeader:
+        polls = 0
+
+        def poll(self):
+            self.polls += 1
+            return 0
+
+    leader = ExitedLeader()
+    monkeypatch.setattr(
+        run_guarded_model,
+        "_group_exists",
+        lambda _process_group_id: leader.polls == 0,
+    )
+    assert run_guarded_model._wait_group_gone(12345, 0.1, leader) is True
+    assert leader.polls == 1
 
 
 def test_persistent_eperm_marks_cleanup_failed(tmp_path, monkeypatch):

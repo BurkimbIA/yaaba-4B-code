@@ -93,12 +93,22 @@ def _group_exists(process_group_id: int) -> bool:
     return True
 
 
-def _wait_group_gone(process_group_id: int, timeout: float) -> bool:
+def _wait_group_gone(
+    process_group_id: int,
+    timeout: float,
+    leader: subprocess.Popen | None = None,
+) -> bool:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
+        if leader is not None:
+            # Reap only our direct child. On Linux, an exited but unreaped
+            # group leader keeps killpg(..., 0) reporting the PGID as present.
+            leader.poll()
         if not _group_exists(process_group_id):
             return True
         time.sleep(min(0.01, timeout))
+    if leader is not None:
+        leader.poll()
     return not _group_exists(process_group_id)
 
 
@@ -115,14 +125,14 @@ def _terminate_group(process: subprocess.Popen, grace_seconds: float) -> bool:
         # The group may disappear during the grace interval. If it remains,
         # the post-SIGKILL existence check below fails closed.
         pass
-    if not _wait_group_gone(process_group_id, grace_seconds):
+    if not _wait_group_gone(process_group_id, grace_seconds, process):
         try:
             os.killpg(process_group_id, signal.SIGKILL)
         except ProcessLookupError:
             pass
         except PermissionError:
             pass
-        if not _wait_group_gone(process_group_id, grace_seconds):
+        if not _wait_group_gone(process_group_id, grace_seconds, process):
             raise RuntimeError(f"process group {process_group_id} survived SIGKILL")
     process.wait()
     return True
