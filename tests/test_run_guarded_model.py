@@ -36,7 +36,7 @@ def _args(tmp_path: Path, command: list[str]) -> list[str]:
         "--poll-seconds",
         "0.01",
         "--termination-grace-seconds",
-        "0.05",
+        "0.5",
         "--walltime-seconds",
         "5",
         "--",
@@ -217,4 +217,34 @@ def test_guard_cleans_process_group_after_root_exits(tmp_path, monkeypatch):
         pytest.fail(f"guard released its lock while descendant {pid} remained")
     summary = json.loads((tmp_path / "status.json").read_text())
     assert summary["stop_reason"] == "descendant_process_group_cleanup"
+    assert summary["returncode"] == 70
+
+
+def test_group_existence_treats_transient_eperm_as_indeterminate(monkeypatch):
+    outcomes = [PermissionError(), PermissionError(), ProcessLookupError()]
+
+    def killpg(_process_group_id, _signal):
+        raise outcomes.pop(0)
+
+    monkeypatch.setattr(run_guarded_model.os, "killpg", killpg)
+    assert run_guarded_model._wait_group_gone(12345, 0.1) is True
+    assert outcomes == []
+
+
+def test_persistent_eperm_marks_cleanup_failed(tmp_path, monkeypatch):
+    monkeypatch.setattr(run_guarded_model, "_health", lambda _url: HEALTHY)
+    original_terminate = run_guarded_model._terminate_group
+
+    def persistent_eperm(process, grace_seconds):
+        if process.poll() is None:
+            return original_terminate(process, grace_seconds)
+        raise PermissionError("persistent process-group uncertainty")
+
+    monkeypatch.setattr(run_guarded_model, "_terminate_group", persistent_eperm)
+    result = run_guarded_model.main(
+        _args(tmp_path, [sys.executable, "-c", "raise SystemExit(0)"])
+    )
+    assert result == 70
+    summary = json.loads((tmp_path / "status.json").read_text())
+    assert summary["stop_reason"] == "process_group_cleanup_failed"
     assert summary["returncode"] == 70

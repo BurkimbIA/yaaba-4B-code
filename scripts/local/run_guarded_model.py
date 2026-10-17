@@ -86,6 +86,10 @@ def _group_exists(process_group_id: int) -> bool:
         os.killpg(process_group_id, 0)
     except ProcessLookupError:
         return False
+    except PermissionError:
+        # macOS can transiently return EPERM while an orphaned process group is
+        # being reaped. Treat that as indeterminate/present and keep waiting.
+        return True
     return True
 
 
@@ -107,10 +111,16 @@ def _terminate_group(process: subprocess.Popen, grace_seconds: float) -> bool:
         os.killpg(process_group_id, signal.SIGTERM)
     except ProcessLookupError:
         pass
+    except PermissionError:
+        # The group may disappear during the grace interval. If it remains,
+        # the post-SIGKILL existence check below fails closed.
+        pass
     if not _wait_group_gone(process_group_id, grace_seconds):
         try:
             os.killpg(process_group_id, signal.SIGKILL)
         except ProcessLookupError:
+            pass
+        except PermissionError:
             pass
         if not _wait_group_gone(process_group_id, grace_seconds):
             raise RuntimeError(f"process group {process_group_id} survived SIGKILL")

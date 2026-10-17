@@ -1,3 +1,4 @@
 # Dedicated local experiment-tracking environment; keep training dependencies separate.
 mlflow==3.17.1
+psutil==7.2.2
 pytest>=7.4,<9
