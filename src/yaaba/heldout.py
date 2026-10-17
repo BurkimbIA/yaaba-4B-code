@@ -48,10 +48,9 @@ def load(path: Path | str) -> dict[str, set[str]]:
     return by_capability
 
 
-# A part missing from `TARGETS` is checked against nothing and reports clean,
-# which is also what a typo in its name gives. Use this for text that belongs to
-# no single part and must be checked against every capability, such as an SFT
-# turn.
+# Text that belongs to no single part, such as an SFT turn, is checked against
+# every capability. Any other unknown part is rejected: treating a typo as an
+# empty target set silently disables the leak detector.
 EVERYTHING: Final = "*"
 
 
@@ -61,8 +60,17 @@ class Guard:
     __slots__ = ("forbidden", "long")
 
     def __init__(self, part: str, held_out: dict[str, set[str]]) -> None:
-        capabilities = (tuple(held_out) if part == EVERYTHING
-                        else TARGETS.get(part, ()))
+        if part == EVERYTHING:
+            capabilities = tuple(held_out)
+        else:
+            try:
+                capabilities = TARGETS[part]
+            except KeyError as error:
+                known = ", ".join(sorted(TARGETS))
+                raise ValueError(
+                    f"unknown mixture part {part!r}; refusing to skip the "
+                    f"held-out check (known parts: {known})"
+                ) from error
         self.forbidden = set().union(*(held_out.get(c, set()) for c in capabilities)) \
             if capabilities else set()
         self.long = {k for k in self.forbidden if len(k) >= MIN_CONTAINMENT}

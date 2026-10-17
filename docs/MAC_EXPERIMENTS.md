@@ -1,0 +1,177 @@
+# Expériences locales SFT et évaluation sur Mac Apple Silicon
+
+## Portée et identité des modèles
+
+Ces scripts produisent des preuves techniques reproductibles. Ils ne valident
+ni la qualité conversationnelle en mooré ni un modèle fondation. Une métrique
+automatique ou un smoke synthétique n'est pas un jugement de locuteur.
+
+Le vrai Yaaba n'était pas disponible dans le cache local le 17 octobre 2026.
+Ses révisions distantes connues sont `6338b1d5ac936680701259f0f49c6035589c7563`
+pour `burkimbia/yaaba-4B-base` et
+`f94c7c87944b53a7decb2081d1be5c5804ced5d9` pour l'assistant. Un run sur
+`McGill-NLP/AfriqueQwen3.5-4B-50Langs-Instruct-v1` révision
+`0ff0ff64853f73e7065d6f743585309ad87755d3` est une nouvelle adaptation du
+challenger AfriqueQwen3.5. Il ne constitue pas l'expérience E2 Yaaba.
+
+## Environnement isolé
+
+Le chemin principal est MLX-LM. Il exploite directement Apple Silicon et évite
+une conversion lorsque le checkpoint Hugging Face est déjà chargeable. La voie
+Transformers/PEFT sur MPS est un repli : elle consomme davantage de mémoire,
+mais ses checkpoints restaurent aussi l'optimiseur et le scheduler.
+
+```bash
+python3.12 -m venv .venv-mac
+.venv-mac/bin/python -m pip install -r requirements-mac-experiments.txt
+.venv-mac/bin/python -m pytest -q
+```
+
+Les versions exercées sont MLX-LM 0.32.2, MLX 0.32.4, Transformers 5.20.1 et
+Torch 2.14.1. MLX-LM 0.30.7 a introduit le support texte de Qwen3.5 ; 0.32.2
+inclut les correctifs ultérieurs. Les API utilisées correspondent à la
+[documentation LoRA officielle](https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/LORA.md),
+au [config d'exemple officiel](https://github.com/ml-explore/mlx-lm/blob/main/examples/lora_config.yaml)
+et à l'[API de génération officielle](https://github.com/ml-explore/mlx-lm#python-api).
+
+## Contrats de sûreté
+
+`train_mlx.py` impose :
+
+- un fichier held-out réel pour tout entraînement ; son absence ou toute fuite
+  bloque avant le chargement du modèle ;
+- un split source conservé, ou un split SHA-256 déterministe par groupe ; un
+  groupe présent dans deux splits bloque le run ;
+- une expansion multi-tours en un préfixe par réponse assistant ; MLX-LM reçoit
+  `mask_prompt: true`, et MPS vérifie token par token que le prompt est un
+  préfixe exact avant de poser les labels `-100`. Un préflight avec le vrai
+  tokenizer supprime les exemples tronqués et exige au moins un token assistant
+  supervisé dans chaque exemple conservé ;
+- des plafonds d'échantillons, pas, temps mural et mémoire. MLX fixe aussi la
+  limite de son allocateur à 32 Gio par défaut ; un moniteur interrompt le groupe
+  de processus au-dessus de cette limite ou après trois mesures sous 4 Gio de
+  mémoire système disponible. MPS fixe sa fraction d'allocateur et vérifie les
+  mêmes seuils aux frontières de pas ;
+- un manifeste avec SHA-256 du corpus, du held-out, du template, du tokenizer et
+  de tous les poids locaux ;
+- un contrat de reprise immuable. Une modification de données, modèle, seed ou
+  config oblige à ouvrir un autre dossier de run.
+
+MLX-LM sauvegarde les adaptateurs périodiques et les recharge avec
+`resume_adapter_file`. Cette reprise restaure les poids LoRA, mais pas l'état de
+l'optimiseur ; chaque segment le signale dans `result.json`. Le backend MPS
+utilise les checkpoints Trainer et restaure poids, optimiseur, scheduler et pas.
+
+Le corpus `moore_assistant_sft.jsonl` ne fournit pas actuellement un identifiant
+de document ou de groupe dont l'indépendance soit prouvée ; son champ `source`
+grossier traverse 205 splits. Le runner refuse donc ce corpus par défaut. Le
+drapeau `--allow-ungrouped-technical-pilot` conserve les splits source, marque
+`grouping_verified: false` et limite la conclusion à la validation logicielle et
+à la rétropropagation. Ce mode ne produit aucune mesure de qualité ni split gold.
+
+Le pilote recommandé a été produit par le commit données
+`ea0f56a1847886094277bd7d0b6f6785d5e5034a` : 512 lignes et 74 groupes fins,
+avec zéro doublon, conflit ou correspondance held-out selon les contrôles exacts
+et normalisés du pipeline. Son SHA-256 est
+`094b32d4a9649f40f11f9674b80f8ae6a29a704ab760aa706f601c1f4394d0e1`.
+Il reste explicitement `technical-only` et n'a pas reçu de validation
+linguistique humaine.
+
+## Template Qwen3.5 explicite
+
+Le snapshot AfriqueQwen3.5 cité plus haut n'embarque pas de `chat_template`.
+Le laisser implicite rendrait prompt et masque indéterminés. Le fichier
+`configs/qwen3_5_chat_template.jinja` vient du tokenizer officiel
+`Qwen/Qwen3.5-4B` à la révision
+`851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a`. La condition locale désactive le
+thinking par défaut lorsque MLX-LM ne transmet pas le drapeau. Le runner crée
+un overlay de symlinks et ne copie ni ne convertit les 8,4 Go de poids.
+
+## Préparer et lancer un pilote borné
+
+Les chemins ci-dessous illustrent le challenger public. Le corpus corrigé et le
+held-out restent locaux et ne sont jamais recopiés dans Git.
+
+```bash
+MODEL="$HOME/.cache/huggingface/hub/models--McGill-NLP--AfriqueQwen3.5-4B-50Langs-Instruct-v1/snapshots/0ff0ff64853f73e7065d6f743585309ad87755d3"
+BURKIMBIA_ROOT="/Users/josias/Documents/Personnal/BurkimbIA"
+DATA="$BURKIMBIA_ROOT/ml-research/agents/data/worktrees/bia-datasets-text/output/yaaba-lineage/pilot.jsonl"
+HELDOUT="$BURKIMBIA_ROOT/yaaba-4B/evaluation/tenu_a_lecart.jsonl"
+
+.venv-mac/bin/python scripts/local/train_mlx.py \
+  --backend mlx \
+  --model "$MODEL" \
+  --model-revision 0ff0ff64853f73e7065d6f743585309ad87755d3 \
+  --chat-template configs/qwen3_5_chat_template.jinja \
+  --data "$DATA" \
+  --heldout "$HELDOUT" \
+  --group-field lineage.group_hash \
+  --technical-pilot \
+  --output artifacts/runs/afriqueqwen35-pilot \
+  --max-train-samples 128 \
+  --max-valid-samples 32 \
+  --max-test-samples 32 \
+  --max-steps 5 \
+  --walltime-minutes 10 \
+  --max-seq-length 512 \
+  --batch-size 1 \
+  --grad-accumulation 1 \
+  --num-layers 2 \
+  --save-every 1 \
+  --eval-every 2 \
+  --report-every 1 \
+  --memory-limit-gb 32 \
+  --minimum-available-gb 4
+```
+
+Ajouter `--dry-run` prépare les splits, hash et commandes sans charger le
+modèle. `--mock-smoke` exécute uniquement un fixture logiciel explicitement
+marqué `TECHNICAL_MOCK`. Pour reprendre, relancer la même commande avec
+`--resume`. Le plafond `--max-steps` est le total cumulé, pas le nombre de pas
+supplémentaires.
+
+Avec la branche MLOps intégrée, ajouter `--track` journalise manifeste,
+métriques, ressources et checkpoints dans MLflow local
+`http://127.0.0.1:5001`. Une reprise MLflow peut aussi fournir
+`--mlflow-run-id`. Le manifeste autonome reste écrit même sans MLflow.
+
+## Évaluation baseline et adaptée
+
+L'évaluateur accepte des lignes `{"id": ..., "messages": [...]}` ou
+`{"id": ..., "prompt": ...}`. Une référence optionnelle autorise exact match
+normalisé et chrF. Les réponses, nombres de tokens, latences, fin de génération,
+hash du prompt rendu et identité du décodage sont sauvegardés. Les prompts et
+références gated ne sont pas dupliqués dans les sorties.
+
+```bash
+.venv-mac/bin/python scripts/local/evaluate_local.py \
+  --backend mlx \
+  --model "$MODEL" \
+  --model-revision 0ff0ff64853f73e7065d6f743585309ad87755d3 \
+  --chat-template configs/qwen3_5_chat_template.jinja \
+  --questions /chemin/local/questions.jsonl \
+  --output artifacts/eval/afriqueqwen35-base \
+  --label afriqueqwen35-base \
+  --max-samples 128 \
+  --max-tokens 256 \
+  --walltime-minutes 30
+```
+
+Pour l'adapté, conserver exactement questions, template, seed et décodage, puis
+ajouter `--adapter /chemin/adapters`. Les deux manifestes permettent de vérifier
+leur identité. Le décodage est greedy (`temperature=0`), sans draft model et
+avec thinking désactivé.
+
+## Compatibilité observée du challenger
+
+Le 17 octobre 2026, le snapshot AfriqueQwen3.5 ci-dessus a été chargé
+directement par MLX-LM 0.32.2, sans conversion. Un prompt français greedy a
+produit 25 tokens puis EOS : 2,52 s, 54,1 tokens/s de décodage, pic MLX 8,54 Go.
+`/usr/bin/time -l` a observé 3,11 Go de RSS maximal et 9,25 Go de peak memory
+footprint ; le processus complet, incluant le SHA-256 des 8,41 Go de poids, a
+duré 11,08 s. Le SHA-256 du poids est
+`55da672dc001dcc6a1515e699818dab94151a4d9d3d62bde6173a4b7ea62d342`.
+
+Cela prouve le chargement et la génération texte locale pour cette révision.
+Cela ne prouve pas encore que la rétropropagation Qwen3.5 tient dans le budget
+mémoire, ni que les réponses en mooré sont correctes.

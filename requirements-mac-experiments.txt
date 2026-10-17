@@ -1,0 +1,16 @@
+# Reproducible Apple-silicon environment tested on 2026-10-17.
+# MLX-LM 0.30.7 introduced text-only Qwen3.5 support; 0.32.2 is the
+# version exercised by the local runners and includes later Qwen3.5 fixes.
+mlx-lm[train]==0.32.2
+mlx==0.32.4
+
+# Optional `--backend mps` fallback and automatic metrics.
+torch==2.14.1
+transformers==5.20.1
+peft==0.21.2
+sacrebleu==2.6.0
+psutil==7.2.2
+
+# Local verification only.
+pytest==9.1.1
+ruff==0.17.1
