@@ -25,7 +25,9 @@ sys.path.insert(0, str(ROOT / "src"))
 from yaaba.evaluation_protocol import (  # noqa: E402
     EvaluationProtocolError,
     authorize_evaluation,
+    finalize_evaluation,
 )
+from yaaba.experiment_tracking import sha256_path  # noqa: E402
 from yaaba.local_experiments import (  # noqa: E402
     canonical_hash,
     git_identity,
@@ -372,15 +374,14 @@ def main(argv: list[str] | None = None) -> int:
         ("mlx", "mlx-lm", "torch", "transformers", "peft", "sacrebleu")
     )
     system_contract = {
+        "backend": args.backend,
         "model_identity_sha256": identity.get(
             "identity_sha256", canonical_hash({
                 "model": identity.get("model"), "revision": identity.get("revision")
             })
         ),
         "adapter_identity_sha256": (
-            adapter_identity.get("identity_sha256")
-            or adapter_identity.get("sha256")
-            or canonical_hash(adapter_identity)
+            sha256_path(args.adapter)
             if adapter_identity else None
         ),
         "chat_template_sha256": template_identity["sha256"],
@@ -400,9 +401,15 @@ def main(argv: list[str] | None = None) -> int:
             "chrf": "sacrebleu.corpus_chrf defaults",
         },
         "metric_versions": {"sacrebleu": versions["sacrebleu"]},
+        "runtime_versions": versions,
+        "budget": {
+            "max_samples": args.max_samples,
+            "walltime_seconds": args.walltime_minutes * 60,
+        },
     }
     system_contract_sha256 = canonical_hash(system_contract)
     questions_sha256 = sha256_file(args.questions)
+    questions_record_count = sum(1 for _ in read_jsonl(args.questions))
     try:
         evaluation_protocol = authorize_evaluation(
             protocol_path=args.evaluation_protocol,
@@ -410,6 +417,8 @@ def main(argv: list[str] | None = None) -> int:
             split_id=args.split_id,
             purpose=args.evaluation_purpose,
             questions_sha256=questions_sha256,
+            questions_record_count=questions_record_count,
+            sample_limit=args.max_samples,
             system_contract_sha256=system_contract_sha256,
         )
     except EvaluationProtocolError as error:
@@ -449,6 +458,14 @@ def main(argv: list[str] | None = None) -> int:
         metrics, template_options = _run_evaluation(args, results_path, generator)
         if sha256_file(args.questions) != questions_sha256:
             raise RuntimeError("questions file changed during evaluation")
+        try:
+            manifest["evaluation_protocol"] = finalize_evaluation(
+                manifest["evaluation_protocol"],
+                completed=metrics["completed"],
+                stop_reason=metrics["stop_reason"],
+            )
+        except EvaluationProtocolError as error:
+            raise RuntimeError(f"evaluation completion refused: {error}") from error
         write_json(output / "metrics.json", metrics)
         manifest["chat_template_options_used"] = template_options
         manifest["results_sha256"] = sha256_file(results_path)

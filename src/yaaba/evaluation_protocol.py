@@ -118,6 +118,11 @@ def _validated_splits(protocol: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
         group_evidence_sha256 = _sha256(
             item.get("group_evidence_sha256"), f"{prefix}.group_evidence_sha256"
         )
+        expected_record_count = item.get("expected_record_count")
+        if not isinstance(expected_record_count, int) or expected_record_count < 1:
+            raise EvaluationProtocolError(
+                f"{prefix}.expected_record_count must be a positive integer"
+            )
         owner = data_owners.get(data_sha256)
         if owner is not None:
             raise EvaluationProtocolError(
@@ -164,6 +169,7 @@ def _validated_splits(protocol: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
                 "split_manifest_sha256": split_manifest_sha256,
                 "group_evidence_sha256": group_evidence_sha256,
                 "group_ids": normalized_groups,
+                "expected_record_count": expected_record_count,
             }
         )
         by_id[split_id] = normalized
@@ -178,6 +184,8 @@ def authorize_evaluation(
     split_id: str | None,
     purpose: str,
     questions_sha256: str,
+    questions_record_count: int,
+    sample_limit: int,
     system_contract_sha256: str,
 ) -> dict[str, Any]:
     """Validate an evaluation role and return a manifest-ready receipt.
@@ -190,6 +198,10 @@ def authorize_evaluation(
     if purpose not in PURPOSES:
         raise EvaluationProtocolError(f"purpose must be one of {sorted(PURPOSES)}")
     questions_sha256 = _sha256(questions_sha256, "questions_sha256")
+    if not isinstance(questions_record_count, int) or questions_record_count < 1:
+        raise EvaluationProtocolError("questions_record_count must be positive")
+    if not isinstance(sample_limit, int) or sample_limit < 1:
+        raise EvaluationProtocolError("sample_limit must be positive")
     system_contract_sha256 = _sha256(system_contract_sha256, "system_contract_sha256")
     if protocol_path is None:
         if expected_protocol_sha256 is not None:
@@ -207,7 +219,8 @@ def authorize_evaluation(
             "split_id": None,
             "split_role": "diagnostic_exposed",
             "role_source": "default_fail_closed",
-            "independent_test_claim": False,
+            "final_test_authorized": False,
+            "final_test_completed": False,
             "independence_status": "not_claimed",
             "protocol": None,
             "guard_scope": (
@@ -243,6 +256,10 @@ def authorize_evaluation(
         raise EvaluationProtocolError(
             "questions SHA-256 does not match the declared split content"
         )
+    if selected["expected_record_count"] != questions_record_count:
+        raise EvaluationProtocolError(
+            "question record count does not match expected_record_count"
+        )
 
     role = selected["role"]
     if role == "training":
@@ -270,6 +287,10 @@ def authorize_evaluation(
             raise EvaluationProtocolError(
                 "runtime system contract is absent from the frozen allowlist"
             )
+        if sample_limit < selected["expected_record_count"]:
+            raise EvaluationProtocolError(
+                "sample_limit is smaller than the sealed test record count"
+            )
     elif purpose == "development":
         if role != "development_frozen":
             raise EvaluationProtocolError(
@@ -286,9 +307,10 @@ def authorize_evaluation(
         "split_id": selected_id,
         "split_role": role,
         "role_source": "frozen_protocol",
-        "independent_test_claim": purpose == "final_test",
+        "final_test_authorized": purpose == "final_test",
+        "final_test_completed": False,
         "independence_status": (
-            "declared_and_metadata_checked_not_empirically_proven"
+            "protocol_local_authorization_only"
             if purpose == "final_test"
             else "not_claimed"
         ),
@@ -301,9 +323,35 @@ def authorize_evaluation(
             "group_evidence_sha256": selected["group_evidence_sha256"],
         },
         "questions_sha256": questions_sha256,
+        "expected_record_count": selected["expected_record_count"],
         "system_contract_sha256": system_contract_sha256,
         "guard_scope": (
-            "metadata consistency guard; does not prove complete exposure or "
-            "real-world source-group independence"
+            "current pinned protocol metadata only; no cross-protocol exposure "
+            "registry and no proof of complete, case-normalized or ancestral "
+            "source-group independence"
         ),
     }
+
+
+def finalize_evaluation(
+    receipt: Mapping[str, Any], *, completed: int, stop_reason: str
+) -> dict[str, Any]:
+    """Mark a fully consumed sealed test complete after generation succeeds."""
+
+    result = dict(receipt)
+    if not result.get("final_test_authorized"):
+        return result
+    expected = result.get("expected_record_count")
+    if completed != expected:
+        raise EvaluationProtocolError(
+            f"sealed test incomplete: completed {completed}, expected {expected}"
+        )
+    if stop_reason != "sample_limit_or_input_end":
+        raise EvaluationProtocolError(
+            f"sealed test stopped with non-completion reason: {stop_reason}"
+        )
+    result["final_test_completed"] = True
+    result["independence_status"] = (
+        "protocol_declared_complete_metadata_consistent_not_empirically_proven"
+    )
+    return result
