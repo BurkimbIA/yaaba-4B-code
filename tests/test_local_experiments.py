@@ -295,14 +295,53 @@ def test_failed_result_raises_inside_tracking_context(status):
         })
 
 
-def test_walltime_without_checkpoint_fails_but_saved_stop_is_valid():
+@pytest.mark.parametrize("checkpoint", [None, "checkpoint"])
+def test_walltime_marks_tracking_failed_even_when_recoverable(checkpoint):
+    seen = []
+
+    class RecordingContext:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, _exc, _traceback):
+            seen.append(exc_type)
+
     with pytest.raises(train_mlx.TrainingRunFailed, match="walltime_limit"):
-        train_mlx._raise_for_failed_result({
-            "status": "walltime_limit", "latest_adapter": None,
-        })
-    train_mlx._raise_for_failed_result({
-        "status": "walltime_limit", "latest_adapter": "checkpoint",
-    })
+        with RecordingContext():
+            train_mlx._raise_for_failed_result({
+                "status": "walltime_limit", "latest_adapter": checkpoint,
+            })
+    assert seen == [train_mlx.TrainingRunFailed]
+
+
+def test_tracking_logs_only_new_metric_lines(tmp_path):
+    class FakeTracked:
+        def __init__(self):
+            self.metrics = []
+
+        def log_metric(self, name, value, *, kind, step):
+            self.metrics.append((name, value, kind, step))
+
+        def log_artifact(self, *_args, **_kwargs):
+            pass
+
+        def log_checkpoint(self, *_args, **_kwargs):
+            pass
+
+    _jsonl(tmp_path / "metrics.jsonl", [
+        {"name": "loss", "value": 2.0, "kind": "ml", "step": 1},
+        {"name": "loss", "value": 1.0, "kind": "ml", "step": 2},
+    ])
+    (tmp_path / "tracking_state.json").write_text(json.dumps({
+        "mlflow_run_id": "run", "metrics_lines_logged": 1,
+    }), encoding="utf-8")
+    tracked = FakeTracked()
+    train_mlx._log_tracking(tracked, tmp_path, {})
+    assert tracked.metrics == [("loss", 1.0, "ml", 2)]
+    state = json.loads((tmp_path / "tracking_state.json").read_text())
+    assert state["metrics_lines_logged"] == 2
+    train_mlx._log_tracking(tracked, tmp_path, {})
+    assert tracked.metrics == [("loss", 1.0, "ml", 2)]
 
 
 def test_explicit_mock_smokes_write_honest_artifacts(tmp_path):

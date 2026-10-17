@@ -70,8 +70,10 @@ exprimés en mises à jour de l'optimiseur. Pour MLX, le runner les multiplie pa
 `--grad-accumulation` avant de produire les micro-pas et refuse un checkpoint
 hors frontière de mise à jour. Le contrat de reprise inclut le commit, l'état
 Git et les versions du runtime. Une reprise trackée recharge obligatoirement le
-Run ID MLflow persisté ; un échec ou une limite sans checkpoint lève une erreur
-dans le contexte de suivi et marque le run `FAILED`.
+Run ID MLflow persisté. Un échec ou toute limite de temps lève une erreur dans
+le contexte de suivi et marque le segment `FAILED`, même si son checkpoint rend
+la reprise possible. Un curseur de lignes empêche de relogguer les anciennes
+métriques lors de cette reprise.
 
 Le corpus `moore_assistant_sft.jsonl` ne fournit pas actuellement un identifiant
 de document ou de groupe dont l'indépendance soit prouvée ; son champ `source`

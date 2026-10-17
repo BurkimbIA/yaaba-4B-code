@@ -603,13 +603,21 @@ def _tracking_context(args: argparse.Namespace, manifest: dict, run: Path):
 def _log_tracking(tracked, run: Path, result: dict) -> None:
     if tracked is None:
         return
+    state_path = run / "tracking_state.json"
+    state = json.loads(state_path.read_text()) if state_path.exists() else {}
     metrics = run / "metrics.jsonl"
     if metrics.exists():
-        for _, row in read_jsonl(metrics):
+        rows = list(read_jsonl(metrics))
+        logged = int(state.get("metrics_lines_logged", 0))
+        if logged < 0 or logged > len(rows):
+            raise ValueError("invalid metrics_lines_logged in tracking_state.json")
+        for index, (_, row) in enumerate(rows[logged:], start=logged + 1):
             tracked.log_metric(
                 row["name"], row["value"], kind=row["kind"],
                 step=int(row.get("step", 0)),
             )
+            state["metrics_lines_logged"] = index
+            write_json(state_path, state)
     for name in ("manifest.json", "tracking_manifest.json", "tracking_state.json",
                  "result.json",
                  "resources.jsonl", "command.json"):
@@ -651,11 +659,8 @@ def _raise_for_failed_result(result: dict) -> None:
     failed = result.get("status") in {
         "process_failed", "rss_memory_limit", "system_memory_floor"
     }
-    limit_without_checkpoint = (
-        result.get("status") == "walltime_limit" and
-        not result.get("latest_adapter")
-    )
-    if failed or limit_without_checkpoint:
+    bounded_stop = result.get("status") == "walltime_limit"
+    if failed or bounded_stop:
         # This executes inside tracked_run so its __exit__ marks MLflow FAILED.
         raise TrainingRunFailed(str(result.get("status")))
 
@@ -778,11 +783,16 @@ def main(argv: list[str] | None = None) -> int:
     try:
         with _tracking_context(args, manifest, run) as tracked:
             if tracked is not None:
-                write_json(run / "tracking_state.json", {
+                state_path = run / "tracking_state.json"
+                tracking_state = (
+                    json.loads(state_path.read_text()) if state_path.exists() else {}
+                )
+                tracking_state.update({
                     "mlflow_run_id": tracked.run_id,
                     "tracking_uri": args.tracking_uri,
                     "experiment_name": args.experiment_name,
                 })
+                write_json(state_path, tracking_state)
             if args.mock_smoke:
                 result = {
                     "status": "mock_smoke_passed", "completed_steps": 0,
