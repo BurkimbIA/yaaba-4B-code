@@ -107,38 +107,57 @@ def redact_secrets(value: Any) -> Any:
 
 
 def sha256_path(path: str | os.PathLike[str]) -> str:
-    """Hash a file, symlink, or directory tree deterministically."""
+    """Hash resolved file content or a resolved directory tree deterministically.
+
+    Symbolic links are followed deliberately: a manifest identity must change
+    when the model/tokenizer blob behind a stable overlay path changes.  Cyclic
+    directory links are rejected rather than assigned a misleading digest.
+    """
 
     source = Path(path)
-    if not source.exists() and not source.is_symlink():
+    if not source.exists():
         raise FileNotFoundError(source)
-    if source.is_file() and not source.is_symlink():
+
+    def hash_file(file_path: Path) -> str:
         digest = hashlib.sha256()
-        with source.open("rb") as handle:
+        with file_path.open("rb") as handle:
             for chunk in iter(lambda: handle.read(1024 * 1024), b""):
                 digest.update(chunk)
         return digest.hexdigest()
 
-    digest = hashlib.sha256()
-    if source.is_symlink():
-        digest.update(b"symlink\0")
-        digest.update(os.readlink(source).encode("utf-8"))
-        return digest.hexdigest()
+    def hash_resolved_tree(directory: Path, active: set[tuple[int, int]]) -> str:
+        resolved = directory.resolve(strict=True)
+        identity = resolved.stat()
+        inode = (identity.st_dev, identity.st_ino)
+        if inode in active:
+            raise ValueError(f"cyclic directory symlink: {directory}")
+        active.add(inode)
+        try:
+            digest = hashlib.sha256()
+            digest.update(b"directory\0")
+            for child in sorted(resolved.iterdir(), key=lambda item: item.name):
+                target = child.resolve(strict=True)
+                name = child.name.encode("utf-8")
+                if target.is_file():
+                    digest.update(b"F\0" + name + b"\0")
+                    digest.update(hash_file(target).encode("ascii") + b"\0")
+                elif target.is_dir():
+                    digest.update(b"D\0" + name + b"\0")
+                    digest.update(
+                        hash_resolved_tree(target, active).encode("ascii") + b"\0"
+                    )
+                else:
+                    raise ValueError(f"unsupported filesystem entry: {child}")
+            return digest.hexdigest()
+        finally:
+            active.remove(inode)
 
-    for child in sorted(source.rglob("*"), key=lambda item: item.relative_to(source).as_posix()):
-        relative = child.relative_to(source).as_posix().encode("utf-8")
-        if child.is_symlink():
-            digest.update(b"L\0" + relative + b"\0")
-            digest.update(os.readlink(child).encode("utf-8") + b"\0")
-        elif child.is_dir():
-            digest.update(b"D\0" + relative + b"\0")
-        elif child.is_file():
-            digest.update(b"F\0" + relative + b"\0")
-            with child.open("rb") as handle:
-                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                    digest.update(chunk)
-            digest.update(b"\0")
-    return digest.hexdigest()
+    resolved = source.resolve(strict=True)
+    if resolved.is_file():
+        return hash_file(resolved)
+    if resolved.is_dir():
+        return hash_resolved_tree(resolved, set())
+    raise ValueError(f"unsupported filesystem entry: {source}")
 
 
 def _validate_sha256(value: object, field: str) -> str:
@@ -149,11 +168,20 @@ def _validate_sha256(value: object, field: str) -> str:
 
 
 def _path_identity(path: Path, *, include_config: bool = False) -> dict[str, Any]:
+    resolved = path.resolve(strict=True)
+    if resolved.is_file():
+        hash_scope = "resolved_file_content" if path.is_symlink() else "file_content"
+    elif resolved.is_dir():
+        hash_scope = (
+            "resolved_directory_tree" if path.is_symlink() else "directory_tree"
+        )
+    else:
+        raise ValueError(f"unsupported filesystem entry: {path}")
     identity: dict[str, Any] = {
         "kind": "path",
         "path": str(path),
         "sha256": sha256_path(path),
-        "hash_scope": "file_content" if path.is_file() else "directory_tree",
+        "hash_scope": hash_scope,
     }
     if include_config and path.is_file() and path.suffix.lower() == ".json":
         parsed = json.loads(path.read_text(encoding="utf-8"))
@@ -236,9 +264,7 @@ def build_manifest(
         payload["stop_criteria"] = redact_secrets(stop_criteria)
     if extra is not None:
         payload["extra"] = redact_secrets(extra)
-    payload["manifest_sha256"] = _sha256_bytes(
-        _canonical_json(payload).encode("utf-8")
-    )
+    payload["manifest_sha256"] = _sha256_bytes(_canonical_json(payload).encode("utf-8"))
     return payload
 
 
@@ -286,7 +312,9 @@ def verify_manifest(manifest: Mapping[str, Any]) -> str:
     expected = _validate_sha256(safe.pop("manifest_sha256"), "manifest_sha256")
     actual = _sha256_bytes(_canonical_json(safe).encode("utf-8"))
     if actual != expected:
-        raise ValueError(f"manifest checksum mismatch: expected {expected}, got {actual}")
+        raise ValueError(
+            f"manifest checksum mismatch: expected {expected}, got {actual}"
+        )
     return expected
 
 
@@ -469,7 +497,9 @@ class TrackedRun:
 
     def _require_active(self) -> None:
         if not self._active or not self.run_id:
-            raise TrackingError("tracking operations require an active tracked_run context")
+            raise TrackingError(
+                "tracking operations require an active tracked_run context"
+            )
 
     def log_metric(
         self,
@@ -541,9 +571,7 @@ class TrackedRun:
         if source.is_dir():
             self.client.log_artifacts(self.run_id, str(source), destination)
         else:
-            self.client.log_artifact(
-                self.run_id, str(source), f"{category}/{digest}"
-            )
+            self.client.log_artifact(self.run_id, str(source), f"{category}/{digest}")
         record = ArtifactRecord(
             kind=kind,
             sha256=digest,
@@ -592,9 +620,7 @@ class TrackedRun:
         run = self.client.get_run(self.run_id)
         prior = int(run.data.tags.get("yaaba.latest_checkpoint_step", "-1"))
         if step >= prior:
-            self.client.set_tag(
-                self.run_id, "yaaba.latest_checkpoint_step", str(step)
-            )
+            self.client.set_tag(self.run_id, "yaaba.latest_checkpoint_step", str(step))
         return record
 
 

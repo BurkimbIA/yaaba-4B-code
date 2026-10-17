@@ -71,11 +71,13 @@ with tracked_run(
                        metadata={"resumable": True})
 ```
 
-Les chemins locaux sont hachés par contenu. Une ressource distante est passée
-sous forme de mapping avec son SHA-256 certifié; sans SHA-256 explicite, le
-module étiquette honnêtement l'empreinte comme empreinte des métadonnées
-canoniques. Le manifeste complet a sa propre empreinte. MLflow la conserve comme
-paramètre immuable et comme artefact `run-manifest/manifest.json`.
+Les chemins locaux sont hachés par contenu. Les liens symboliques sont résolus :
+leur empreinte change si le blob ou l'arbre cible change, même quand le chemin de
+l'overlay reste identique. Une ressource distante est passée sous forme de
+mapping avec son SHA-256 certifié; sans SHA-256 explicite, le module étiquette
+honnêtement l'empreinte comme empreinte des métadonnées canoniques. Le manifeste
+complet a sa propre empreinte. MLflow la conserve comme paramètre immuable et
+comme artefact `run-manifest/manifest.json`.
 
 Pour reprendre un run, reconstruire ou relire exactement le même manifeste et
 passer son identifiant :

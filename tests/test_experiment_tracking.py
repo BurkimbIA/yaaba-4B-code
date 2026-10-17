@@ -60,6 +60,32 @@ def test_sha256_path_tracks_file_names_and_content(tmp_path):
     assert sha256_path(folder) != first
 
 
+def test_symlink_manifest_tracks_resolved_blob_content(tmp_path):
+    paths = materials(tmp_path / "inputs")
+    target = tmp_path / "weights-v1.safetensors"
+    target.write_bytes(b"first synthetic blob")
+    overlay = tmp_path / "model.safetensors"
+    overlay.symlink_to(target)
+
+    common = dict(
+        run_kind="technical-smoke",
+        evidence_kind="OBSERVED",
+        config=paths["config.json"],
+        data=paths["data.jsonl"],
+        code=paths["runner.py"],
+        tokenizer=paths["tokenizer.json"],
+    )
+    first = build_manifest(model=overlay, **common)
+    assert first["model"]["hash_scope"] == "resolved_file_content"
+    assert first["model"]["sha256"] == sha256_path(target)
+
+    target.write_bytes(b"second synthetic blob")
+    second = build_manifest(model=overlay, **common)
+    assert second["model"]["sha256"] == sha256_path(target)
+    assert second["model"]["sha256"] != first["model"]["sha256"]
+    assert second["manifest_sha256"] != first["manifest_sha256"]
+
+
 def test_manifest_is_deterministic_immutable_and_redacted(tmp_path):
     manifest = manifest_for(tmp_path)
     assert verify_manifest(manifest) == manifest["manifest_sha256"]
