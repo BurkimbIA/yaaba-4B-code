@@ -22,6 +22,10 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src"))
 
+from yaaba.evaluation_protocol import (  # noqa: E402
+    EvaluationProtocolError,
+    authorize_evaluation,
+)
 from yaaba.local_experiments import (  # noqa: E402
     canonical_hash,
     git_identity,
@@ -51,6 +55,28 @@ def parser() -> argparse.ArgumentParser:
                         help="explicit Jinja template when the checkpoint omits one")
     result.add_argument("--adapter", type=Path)
     result.add_argument("--questions", type=Path, required=True)
+    result.add_argument(
+        "--evaluation-purpose",
+        choices=("diagnostic", "development", "final_test"),
+        default="diagnostic",
+        help=(
+            "claim role; development/final_test require a frozen protocol, while "
+            "the default remains a non-independent diagnostic"
+        ),
+    )
+    result.add_argument(
+        "--evaluation-protocol",
+        type=Path,
+        help="frozen JSON registry binding split content to an evaluation role",
+    )
+    result.add_argument(
+        "--evaluation-protocol-sha256",
+        help="independently recorded SHA-256 of the frozen protocol file",
+    )
+    result.add_argument(
+        "--split-id",
+        help="opaque split identifier declared by --evaluation-protocol",
+    )
     result.add_argument("--output", type=Path, required=True)
     result.add_argument("--label", default="baseline")
     result.add_argument("--seed", type=int, default=20261017)
@@ -217,7 +243,8 @@ def _tracking_context(args: argparse.Namespace, manifest: dict, output: Path):
         stop_criteria={"sample_limit": args.max_samples,
                        "walltime_seconds": args.walltime_minutes * 60},
         extra={"claim_scope": manifest["claim_scope"], "label": args.label,
-               "adapter": manifest["adapter"]},
+               "adapter": manifest["adapter"],
+               "evaluation_protocol": manifest["evaluation_protocol"]},
     )
     write_manifest(tracking_manifest, output / "tracking_manifest.json")
     return tracked_run(
@@ -340,18 +367,53 @@ def main(argv: list[str] | None = None) -> int:
         "max_tokens": args.max_tokens, "seed": args.seed,
         "thinking_requested": False, "draft_model": None,
     }
+    code_identity = git_identity(ROOT)
+    system_contract = {
+        "model_identity_sha256": identity.get(
+            "identity_sha256", canonical_hash({
+                "model": identity.get("model"), "revision": identity.get("revision")
+            })
+        ),
+        "adapter_identity_sha256": (
+            adapter_identity.get("identity_sha256", canonical_hash(adapter_identity))
+            if adapter_identity else None
+        ),
+        "chat_template_sha256": template_identity["sha256"],
+        "decoding": decoding,
+        "evaluator_code": code_identity,
+        "metrics": {
+            "normalized_exact_match": "yaaba.local_experiments.normalized_text",
+            "chrf": "sacrebleu.corpus_chrf defaults",
+        },
+    }
+    system_contract_sha256 = canonical_hash(system_contract)
+    questions_sha256 = sha256_file(args.questions)
+    try:
+        evaluation_protocol = authorize_evaluation(
+            protocol_path=args.evaluation_protocol,
+            expected_protocol_sha256=args.evaluation_protocol_sha256,
+            split_id=args.split_id,
+            purpose=args.evaluation_purpose,
+            questions_sha256=questions_sha256,
+            system_contract_sha256=system_contract_sha256,
+        )
+    except EvaluationProtocolError as error:
+        raise SystemExit(f"evaluation protocol refused the run: {error}") from error
     manifest = {
         "label": args.label, "backend": args.backend,
         "evidence_kind": "TECHNICAL_MOCK" if args.backend == "mock" else "OBSERVED_LOCAL_RUN",
         "model": identity, "adapter": adapter_identity,
         "chat_template": template_identity,
         "questions": {"path": str(args.questions.resolve()),
-                      "sha256": sha256_file(args.questions)},
+                      "sha256": questions_sha256},
         "decoding": decoding, "max_samples": args.max_samples,
         "walltime_seconds": args.walltime_minutes * 60,
-        "code": git_identity(ROOT),
+        "code": code_identity,
         "versions": package_versions(("mlx", "mlx-lm", "torch", "transformers", "peft")),
         "claim_scope": "automatic metrics and raw generations; no human Mooré score",
+        "system_contract": system_contract,
+        "system_contract_sha256": system_contract_sha256,
+        "evaluation_protocol": evaluation_protocol,
     }
     manifest["evaluation_identity_sha256"] = canonical_hash({
         "model": identity, "adapter": adapter_identity,
@@ -370,6 +432,8 @@ def main(argv: list[str] | None = None) -> int:
 
     with _tracking_context(args, manifest, output) as tracked:
         metrics, template_options = _run_evaluation(args, results_path, generator)
+        if sha256_file(args.questions) != questions_sha256:
+            raise RuntimeError("questions file changed during evaluation")
         write_json(output / "metrics.json", metrics)
         manifest["chat_template_options_used"] = template_options
         manifest["results_sha256"] = sha256_file(results_path)
