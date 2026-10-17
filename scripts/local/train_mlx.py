@@ -333,6 +333,7 @@ def _mlx_config(args: argparse.Namespace, model: Path, run: Path,
     if remaining_updates <= 0:
         raise ValueError(f"run already reached max_steps={args.max_steps}")
     adapter = run / "adapters" / f"segment-{completed:07d}"
+    has_independent_validation = (run / "data" / "valid.jsonl").is_file()
     config = {
         "model": str(model),
         "train": True,
@@ -342,7 +343,7 @@ def _mlx_config(args: argparse.Namespace, model: Path, run: Path,
         "num_layers": args.num_layers,
         "batch_size": args.batch_size,
         "iters": remaining_updates * args.grad_accumulation,
-        "val_batches": 8,
+        "val_batches": -1 if has_independent_validation else 0,
         "learning_rate": args.learning_rate,
         "steps_per_report": min(args.report_every, remaining_updates) * args.grad_accumulation,
         "steps_per_eval": min(args.eval_every, remaining_updates) * args.grad_accumulation,
@@ -753,6 +754,10 @@ def main(argv: list[str] | None = None) -> int:
         "lora_dropout": args.lora_dropout,
         "memory_limit_gb": args.memory_limit_gb,
         "minimum_available_gb": args.minimum_available_gb,
+        "validation": (
+            "separate_valid_split" if (run / "data" / "valid.jsonl").is_file()
+            else "disabled_no_independent_validation"
+        ),
     }
     contract = {
         "model": identity, "chat_template": template_identity,

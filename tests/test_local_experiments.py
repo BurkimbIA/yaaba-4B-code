@@ -241,6 +241,14 @@ def test_mlx_config_is_bounded_and_masks_prompt(tmp_path):
     assert config["grad_checkpoint"] is True
     assert config["steps_per_report"] == 5 * args.grad_accumulation
     assert config["clear_cache_threshold"] == 2 * 1024**3
+    assert config["val_batches"] == 0
+    valid = tmp_path / "out" / "data" / "valid.jsonl"
+    valid.parent.mkdir(parents=True)
+    valid.write_text('{}\n', encoding="utf-8")
+    config_with_validation, _ = train_mlx._mlx_config(
+        args, tmp_path, tmp_path / "out", 4, None
+    )
+    assert config_with_validation["val_batches"] == -1
 
 
 def test_mlx_checkpoint_counts_only_complete_optimizer_updates(tmp_path):

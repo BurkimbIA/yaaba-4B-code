@@ -90,6 +90,11 @@ et normalisés du pipeline. Son SHA-256 est
 Il reste explicitement `technical-only` et n'a pas reçu de validation
 linguistique humaine.
 
+Ce pilote ne contient pas de split validation indépendant. Le runner inscrit
+donc `validation: disabled_no_independent_validation`, configure zéro batch de
+validation et ne calcule aucune `validation_loss`. Il ne prélève jamais une
+validation silencieuse dans les lignes d'entraînement.
+
 ## Template Qwen3.5 explicite
 
 Le snapshot AfriqueQwen3.5 cité plus haut n'embarque pas de `chat_template`.
