@@ -143,11 +143,7 @@ def assistant_completion_tokens(
             "enable_thinking": False,
             "return_dict": False,
         }
-        try:
-            encoded = tokenizer.apply_chat_template(value, **options)
-        except (TypeError, ValueError):
-            options.pop("enable_thinking")
-            encoded = tokenizer.apply_chat_template(value, **options)
+        encoded = tokenizer.apply_chat_template(value, **options)
         if isinstance(encoded, dict):
             encoded = encoded["input_ids"]
         if encoded and isinstance(encoded[0], list):

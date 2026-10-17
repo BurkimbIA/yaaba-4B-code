@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -18,6 +19,7 @@ SCRIPTS = Path(__file__).resolve().parents[1] / "scripts" / "local"
 sys.path.insert(0, str(SCRIPTS))
 
 import evaluate_local  # noqa: E402
+import mlx_lora_bounded  # noqa: E402
 import train_mlx  # noqa: E402
 
 
@@ -56,6 +58,34 @@ class BrokenPrefixTokenizer(ExactPrefixTokenizer):
         return ([777] + result) if not add_generation_prompt else result
 
 
+class ThinkingDefaultTokenizer(ExactPrefixTokenizer):
+    def __init__(self):
+        self.thinking_values = []
+
+    def apply_chat_template(
+        self, messages, *, tokenize=True, add_generation_prompt=False,
+        enable_thinking=True, return_dict=False, tools=None,
+    ):
+        self.thinking_values.append(enable_thinking)
+        tokens = super().apply_chat_template(
+            messages,
+            tokenize=tokenize,
+            add_generation_prompt=add_generation_prompt,
+            enable_thinking=False,
+            return_dict=return_dict,
+        )
+        if enable_thinking and add_generation_prompt:
+            tokens += [701, 702, 703, 704]
+        return tokens
+
+
+class FailingThinkingTokenizer(ThinkingDefaultTokenizer):
+    def apply_chat_template(self, *args, **kwargs):
+        if "enable_thinking" in kwargs:
+            raise ValueError("template rendering failed")
+        return super().apply_chat_template(*args, **kwargs)
+
+
 def test_multi_turn_expands_to_one_completion_per_assistant():
     messages = [
         {"role": "user", "content": "u1"},
@@ -87,6 +117,110 @@ def test_assistant_mask_refuses_approximate_template_boundary():
     ]
     with pytest.raises(ValueError, match="exact prefix"):
         assistant_completion_tokens(BrokenPrefixTokenizer(), messages, 100)
+
+
+def test_mlx_chat_mask_disables_thinking_and_matches_preflight():
+    tokenizer = ThinkingDefaultTokenizer()
+    messages = [
+        {"role": "user", "content": "question"},
+        {"role": "assistant", "content": "answer"},
+    ]
+    dataset = type(
+        "Dataset", (), {
+            "chat_key": "messages", "mask_prompt": True,
+            "tokenizer": tokenizer,
+        },
+    )()
+    tokens, offset = mlx_lora_bounded._exact_chat_process(
+        dataset, {"messages": messages}
+    )
+    expected = assistant_completion_tokens(tokenizer, messages, 100)
+    assert expected is not None
+    expected_offset = next(
+        index for index, label in enumerate(expected["labels"]) if label != -100
+    )
+    assert tokens == expected["input_ids"]
+    assert offset == expected_offset
+    assert all(value is False for value in tokenizer.thinking_values)
+
+
+def test_mlx_chat_mask_does_not_hide_template_value_error():
+    tokenizer = FailingThinkingTokenizer()
+    with pytest.raises(ValueError, match="template rendering failed"):
+        mlx_lora_bounded._apply_chat_template(
+            tokenizer, [], return_dict=False
+        )
+    with pytest.raises(ValueError, match="template rendering failed"):
+        assistant_completion_tokens(
+            tokenizer,
+            [
+                {"role": "user", "content": "question"},
+                {"role": "assistant", "content": "answer"},
+            ],
+            100,
+        )
+
+
+def test_mlx_chat_mask_does_not_fallback_when_kwarg_is_unsupported():
+    class UnsupportedTokenizer:
+        def apply_chat_template(self, messages, *, return_dict=False):
+            return []
+
+    with pytest.raises(TypeError, match="enable_thinking"):
+        mlx_lora_bounded._apply_chat_template(
+            UnsupportedTokenizer(), [], return_dict=False
+        )
+
+
+def test_mlx_load_dataset_uses_exact_mask_and_source_order_before_seed(
+    tmp_path, monkeypatch,
+):
+    pytest.importorskip("mlx.core")
+    import numpy as np
+    from mlx_lm.tuner.datasets import CacheDataset, ChatDataset, load_dataset
+    from mlx_lm.tuner.trainer import iterate_batches
+
+    rows = [
+        {
+            "messages": [
+                {"role": "user", "content": chr(65 + index)},
+                {"role": "assistant", "content": "answer"},
+            ],
+            "_provenance": {"source_index": index},
+        }
+        for index in range(5)
+    ]
+    _jsonl(tmp_path / "train.jsonl", rows)
+    tokenizer = ThinkingDefaultTokenizer()
+    config = SimpleNamespace(
+        data=str(tmp_path), train=True, test=False, mask_prompt=True,
+        hf_dataset=False,
+    )
+    with monkeypatch.context() as patch:
+        # Register the original method for automatic restoration before the
+        # production installer replaces it process-wide.
+        patch.setattr(ChatDataset, "process", ChatDataset.process)
+        mlx_lora_bounded._install_exact_chat_mask()
+        train, _, _ = load_dataset(config, tokenizer)
+        for index, row in enumerate(rows):
+            tokens, offset = train.process(row)
+            expected = assistant_completion_tokens(tokenizer, row["messages"], 100)
+            assert expected is not None
+            expected_offset = next(
+                i for i, label in enumerate(expected["labels"]) if label != -100
+            )
+            assert tokens == expected["input_ids"]
+            assert offset == expected_offset
+            assert tokens[1] == 65 + index
+
+        cached = CacheDataset(train)
+        assert [cached.itemlen(index) for index in range(5)] == [2] * 5
+        batches = iterate_batches(
+            cached, batch_size=1, max_seq_length=100, loop=False, seed=7
+        )
+        observed = [int(batch[0][0, 1].item()) - 65 for batch in batches]
+        expected_order = np.random.RandomState(7).permutation(5).tolist()
+        assert observed == expected_order
 
 
 def test_preflight_drops_overflow_and_keeps_supervised_assistant_token(tmp_path):

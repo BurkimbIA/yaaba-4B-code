@@ -46,7 +46,12 @@ et à l'[API de génération officielle](https://github.com/ml-explore/mlx-lm#py
   `mask_prompt: true`, et MPS vérifie token par token que le prompt est un
   préfixe exact avant de poser les labels `-100`. Un préflight avec le vrai
   tokenizer supprime les exemples tronqués et exige au moins un token assistant
-  supervisé dans chaque exemple conservé ;
+  supervisé dans chaque exemple conservé. Le wrapper MLX impose aussi
+  `enable_thinking: false` au chat complet et au préfixe de masque, puis refuse
+  une frontière qui n'est pas un préfixe exact. Les messages utilisateur et le
+  gabarit vide de raisonnement Qwen3 restent ainsi hors perte. Un tokenizer qui
+  n'accepte pas cette option bloque le run au lieu de revenir silencieusement à
+  son comportement par défaut ;
 - des plafonds d'échantillons, pas, temps mural et mémoire. MLX fixe aussi la
   limite de son allocateur à 32 Gio par défaut ; un moniteur interrompt le groupe
   de processus au-dessus de cette limite ou après trois mesures sous 4 Gio de
