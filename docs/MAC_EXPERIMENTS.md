@@ -251,3 +251,25 @@ Les prompts demandent une forme lexicale courte, alors que plusieurs sorties
 sont des phrases explicatives : exact match et chrF mélangent accès lexical et
 format de réponse. Un diagnostic posthoc de containment reste à zéro dans les
 deux bras et les deux strates. Aucun score humain n'a été produit.
+
+## Borne de loss MLX corrigée pour les nouveaux runs
+
+MLX-LM 0.32.2 remplit ses tableaux de batch avec l'ID `0`, puis sa loss par
+défaut utilise une borne supérieure inclusive (`steps <= length`). Elle inclut
+ainsi une cible de remplissage après chaque séquence. Cet ID `0` n'est pas le
+`pad_token_id` du tokenizer AfriqueQwen (`248044`) et se décode en `!`.
+
+Le wrapper Mac injecte maintenant, uniquement pendant son propre processus,
+une loss utilisant `steps < length`. Le masque conserve tous les tokens réels
+de la réponse, dont `<|im_end|>` et la nouvelle ligne qui le suit, et exclut la
+première position de remplissage. Un ID `0` qui apparaît réellement à
+l'intérieur d'une réponse reste supervisé. La même fonction est transmise par
+MLX à l'entraînement et à la validation. Le hook est retiré dans un bloc
+`finally`, y compris après une exception.
+
+Cette correction s'applique seulement aux nouveaux runs exécutés avec ce
+wrapper. Les métriques historiques conservent le contrat MLX d'alors et ne sont
+pas réécrites. Pour le pilote440 à masque assistant corrigé, l'audit daté compte
+9 216 cibles de séquence réelles et 440 cibles de remplissage supplémentaires
+dans la loss historique. Cela ne démontre pas que le remplissage explique les
+générations atteignant leur plafond.
