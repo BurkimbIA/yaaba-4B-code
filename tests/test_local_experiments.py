@@ -172,6 +172,48 @@ def test_mlx_chat_mask_does_not_fallback_when_kwarg_is_unsupported():
         )
 
 
+def test_evaluation_template_disables_thinking():
+    class EvaluationTokenizer:
+        def __init__(self):
+            self.thinking_values = []
+
+        def apply_chat_template(
+            self, messages, *, tokenize, add_generation_prompt, enable_thinking
+        ):
+            assert tokenize is False
+            assert add_generation_prompt is True
+            self.thinking_values.append(enable_thinking)
+            return "rendered prompt"
+
+    tokenizer = EvaluationTokenizer()
+    messages = [{"role": "user", "content": "question"}]
+    prompt, options = evaluate_local._templated(tokenizer, messages)
+    assert isinstance(prompt, str)
+    assert options == {
+        "tokenize": False,
+        "add_generation_prompt": True,
+        "enable_thinking": False,
+    }
+    assert tokenizer.thinking_values == [False]
+
+
+def test_evaluation_template_does_not_hide_renderer_failure():
+    tokenizer = FailingThinkingTokenizer()
+    messages = [{"role": "user", "content": "question"}]
+    with pytest.raises(ValueError, match="template rendering failed"):
+        evaluate_local._templated(tokenizer, messages)
+
+
+def test_evaluation_template_does_not_fallback_when_kwarg_is_unsupported():
+    class UnsupportedTokenizer:
+        def apply_chat_template(self, messages, *, tokenize, add_generation_prompt):
+            return []
+
+    messages = [{"role": "user", "content": "question"}]
+    with pytest.raises(TypeError, match="enable_thinking"):
+        evaluate_local._templated(UnsupportedTokenizer(), messages)
+
+
 def test_mlx_load_dataset_uses_exact_mask_and_source_order_before_seed(
     tmp_path, monkeypatch,
 ):

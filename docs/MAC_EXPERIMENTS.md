@@ -183,7 +183,9 @@ références gated ne sont pas dupliqués dans les sorties.
 Pour l'adapté, conserver exactement questions, template, seed et décodage, puis
 ajouter `--adapter /chemin/adapters`. Les deux manifestes permettent de vérifier
 leur identité. Le décodage est greedy (`temperature=0`), sans draft model et
-avec thinking désactivé.
+avec thinking désactivé. Le rendu du template est fail-closed : si le tokenizer
+ne supporte pas `enable_thinking=False` ou si le renderer échoue, l'évaluation
+s'arrête au lieu de retirer silencieusement l'option.
 
 ## Compatibilité observée du challenger
 

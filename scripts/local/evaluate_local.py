@@ -90,11 +90,7 @@ def _templated(tokenizer: Any, messages: list[dict[str, str]]) -> tuple[str, dic
         "add_generation_prompt": True,
         "enable_thinking": False,
     }
-    try:
-        prompt = tokenizer.apply_chat_template(messages, **options)
-    except (TypeError, ValueError):
-        options.pop("enable_thinking")
-        prompt = tokenizer.apply_chat_template(messages, **options)
+    prompt = tokenizer.apply_chat_template(messages, **options)
     return str(prompt), options
 
 
