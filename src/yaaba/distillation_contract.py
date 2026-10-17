@@ -247,8 +247,8 @@ def _name(value: object) -> str | None:
 
 
 def _is_evaluation_split(value: str) -> bool:
-    return value in IMMUTABLE_FORBIDDEN_SPLITS or value.startswith(
-        _EVALUATION_SPLIT_PREFIXES
+    return value in IMMUTABLE_FORBIDDEN_SPLITS or any(
+        token.startswith(_EVALUATION_SPLIT_PREFIXES) for token in value.split("_")
     )
 
 
@@ -900,12 +900,16 @@ def register_candidates(
             record["decision"]["status"] == "rejected" for record in records
         ),
     }
-    contract_counts: dict[str, int] = {}
-    dataset_counts: dict[tuple[str, str], int] = {}
+    contract_counts: dict[str, dict[str, int]] = {}
+    dataset_counts: dict[tuple[str, str], dict[str, int]] = {}
     for record in records:
+        status = record["decision"]["status"]
         contract_id = record["generation"]["contract_id"]
         if contract_id in policy.generation_contracts:
-            contract_counts[contract_id] = contract_counts.get(contract_id, 0) + 1
+            by_status = contract_counts.setdefault(
+                contract_id, {"eligible_for_review": 0, "rejected": 0}
+            )
+            by_status[status] += 1
         dataset_id = record["source"]["provenance"]["dataset_id"]
         dataset_revision = record["source"]["provenance"]["dataset_revision"]
         if (
@@ -913,7 +917,10 @@ def register_candidates(
             and policy.allowed_datasets[dataset_id] == dataset_revision
         ):
             key = (dataset_id, dataset_revision)
-            dataset_counts[key] = dataset_counts.get(key, 0) + 1
+            by_status = dataset_counts.setdefault(
+                key, {"eligible_for_review": 0, "rejected": 0}
+            )
+            by_status[status] += 1
     manifest: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "contract_version": CONTRACT_VERSION,
@@ -925,18 +932,18 @@ def register_candidates(
         "registry_sha256": output_sha256,
         "records": len(records),
         "counts": counts,
-        "generation_contracts_observed": [
+        "allowed_generation_contracts_referenced": [
             {
                 **policy.generation_contracts[key],
-                "records": contract_counts[key],
+                "counts": contract_counts[key],
             }
             for key in sorted(contract_counts)
         ],
-        "dataset_identities_observed": [
+        "allowed_dataset_identities_referenced": [
             {
                 "dataset_id": dataset_id,
                 "dataset_revision": revision,
-                "records": dataset_counts[(dataset_id, revision)],
+                "counts": dataset_counts[(dataset_id, revision)],
             }
             for dataset_id, revision in sorted(dataset_counts)
         ],

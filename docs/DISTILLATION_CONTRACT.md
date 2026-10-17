@@ -29,7 +29,8 @@ de source interdits, les rôles de groupe requis, les datasets autorisés et les
 contrats exacts de génération. Les alias connus de développement, validation,
 test, évaluation, gold, heldout, benchmark et revue humaine sont interdits de
 manière immuable dans le code. Ils ne peuvent pas être réautorisés par la
-politique. Un split non explicitement permis est également rejeté.
+politique, y compris lorsqu'ils apparaissent comme token dans `train_dev` ou
+`private_heldout`. Un split non explicitement permis est également rejeté.
 
 Exemple minimal de politique :
 
@@ -76,7 +77,8 @@ les rôles requis par la politique sont présents. La génération nomme son
 la proposition et du décodage. L'identité teacher et l'identité de run doivent
 être octet-identiques au contrat autorisé. Plusieurs teachers restent possibles
 si chacun possède un contrat explicite ; le manifeste agrège les identités
-réellement observées. Le champ optionnel `screening.reject_reasons` n'accepte que
+autorisées référencées avec des comptes séparés `eligible_for_review` et
+`rejected`. Le champ optionnel `screening.reject_reasons` n'accepte que
 les défauts techniques listés plus haut.
 
 Les droits `teacher_generation` et `model_training` sont un plancher immuable,
@@ -99,7 +101,8 @@ créé par lien exclusif et un writer concurrent ne peut pas remplacer un conten
 différent. Le JSONL et son manifeste sont toutefois deux fichiers séparés : un
 arrêt machine entre les deux créations peut laisser un registre sans manifeste,
 qui doit être considéré incomplet. Le manifeste compagnon indique les volumes
-`eligible_for_review` et `rejected`, les identités dataset/teacher/run observées,
+`eligible_for_review` et `rejected`, les identités dataset/teacher/run
+autorisées référencées et leurs comptes par statut,
 l'absence de champs source/proposition/référence, et le fait qu'aucun label
 teacher n'est présenté comme gold.
 

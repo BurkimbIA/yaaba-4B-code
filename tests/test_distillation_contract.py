@@ -139,11 +139,13 @@ def test_valid_candidate_is_only_eligible_for_review(policy, candidate):
         "dev",
         "development",
         "dev32",
+        "train_dev",
         "VAL",
         "validation",
         "test",
         "gold",
         "held_out",
+        "private_heldout",
     ],
 )
 def test_evaluation_or_gold_split_is_rejected(policy, candidate, split):
@@ -275,7 +277,10 @@ def test_registry_is_deterministic_across_input_order(tmp_path, policy, candidat
     assert first_manifest["raw_content_fields_permitted"] is False
     assert first_manifest["references_used_for_filtering"] is False
     assert first_manifest["labels_are_gold"] is False
-    assert first_manifest["generation_contracts_observed"][0]["records"] == 2
+    assert first_manifest["allowed_generation_contracts_referenced"][0]["counts"] == {
+        "eligible_for_review": 2,
+        "rejected": 0,
+    }
 
 
 def test_registry_refuses_to_replace_different_content(tmp_path, policy, candidate):
@@ -385,7 +390,7 @@ def test_multiple_explicit_teacher_contracts_are_aggregated(candidate, tmp_path)
         [candidate, second], policy, tmp_path / "registry.jsonl"
     )
 
-    observed = manifest["generation_contracts_observed"]
+    observed = manifest["allowed_generation_contracts_referenced"]
     assert [item["contract_id"] for item in observed] == [
         "teacher-run-1",
         "teacher-run-2",
