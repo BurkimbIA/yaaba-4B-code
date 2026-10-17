@@ -449,6 +449,65 @@ def test_scoped_assistant_loss_refuses_an_explicit_different_loss():
 
 
 @pytest.mark.parametrize(
+    "mode", ["omitted", "keyword_none", "positional_none", "custom_identical"]
+)
+def test_scoped_assistant_loss_normalizes_supported_call_forms(mode):
+    def original_train(
+        model,
+        optimizer,
+        train_dataset,
+        val_dataset=None,
+        args=None,
+        loss=None,
+    ):
+        return loss
+
+    def original_evaluate(
+        model,
+        dataset,
+        batch_size,
+        num_batches,
+        max_seq_length=2048,
+        loss=None,
+    ):
+        return loss
+
+    lora_module = SimpleNamespace(
+        train=original_train, evaluate=original_evaluate
+    )
+    dataset = [([10, 20, 99], 1)]
+    training_args = SimpleNamespace(max_seq_length=8)
+    custom = mlx_lora_bounded._assistant_loss_without_batch_fill
+    with mlx_lora_bounded._scoped_assistant_loss(lora_module):
+        if mode == "omitted":
+            train_loss = lora_module.train(
+                None, None, dataset, dataset, args=training_args
+            )
+            test_loss = lora_module.evaluate(
+                None, dataset, 1, 1, max_seq_length=8
+            )
+        elif mode == "keyword_none":
+            train_loss = lora_module.train(
+                None, None, dataset, dataset, args=training_args, loss=None
+            )
+            test_loss = lora_module.evaluate(
+                None, dataset, 1, 1, max_seq_length=8, loss=None
+            )
+        elif mode == "positional_none":
+            train_loss = lora_module.train(
+                None, None, dataset, dataset, training_args, None
+            )
+            test_loss = lora_module.evaluate(None, dataset, 1, 1, 8, None)
+        else:
+            train_loss = lora_module.train(
+                None, None, dataset, dataset, training_args, custom
+            )
+            test_loss = lora_module.evaluate(None, dataset, 1, 1, 8, custom)
+    assert train_loss is custom
+    assert test_loss is custom
+
+
+@pytest.mark.parametrize(
     ("tokens", "offset", "max_seq_length"),
     [
         ([10, 20], 2, 8),

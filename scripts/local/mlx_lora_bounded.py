@@ -130,9 +130,8 @@ def _scoped_assistant_loss(lora_module):
         _validate_loss_dataset(
             bound.arguments["val_dataset"], training_args.max_seq_length, "validation"
         )
-        if supplied is None:
-            kwargs["loss"] = _assistant_loss_without_batch_fill
-        return original_train(*args, **kwargs)
+        bound.arguments["loss"] = _assistant_loss_without_batch_fill
+        return original_train(*bound.args, **bound.kwargs)
 
     @wraps(original_evaluate)
     def evaluate_with_assistant_loss(*args, **kwargs):
@@ -144,9 +143,8 @@ def _scoped_assistant_loss(lora_module):
         _validate_loss_dataset(
             bound.arguments["dataset"], bound.arguments["max_seq_length"], "test"
         )
-        if supplied is None:
-            kwargs["loss"] = _assistant_loss_without_batch_fill
-        return original_evaluate(*args, **kwargs)
+        bound.arguments["loss"] = _assistant_loss_without_batch_fill
+        return original_evaluate(*bound.args, **bound.kwargs)
 
     lora_module.train = train_with_assistant_loss
     lora_module.evaluate = evaluate_with_assistant_loss
